@@ -1,630 +1,262 @@
 #!/usr/bin/env bash
 
-# ============================================================
-# VPS INSTALLER
-# Ubuntu only
-# ============================================================
-
-SCRIPT_VERSION="1.2.0"
-
-LOG_DIR="/var/log/vps-setup"
-MASTER_LOG="${LOG_DIR}/install.log"
-BACKUP_DIR="${LOG_DIR}/backup"
-TMP_DIR="/tmp/vps-installer"
-
-mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$TMP_DIR"
+set -Eeuo pipefail
 
 # ============================================================
-# COLORS
+# XanMod Kernel Installer for Ubuntu 24.04+
+# Repository: https://github.com/awosart/vps-installer
 # ============================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-exec > >(tee -a "$MASTER_LOG") 2>&1
+readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
+readonly XANMOD_REPO="http://deb.xanmod.org"
+readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+readonly XANMOD_LIST="/etc/apt/sources.list.d/xanmod-release.list"
+readonly CPU_CHECK_URL="https://dl.xanmod.org/check_x86-64_psabi.sh"
 
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo
+    echo "============================================================"
+    echo " $1"
+    echo "============================================================"
+    echo
 }
 
-info() {
-    echo -e "${BLUE}[INFO]${NC} $*"
+die() {
+    echo
+    echo "ERROR: $1"
+    echo
+    exit 1
 }
 
-success() {
-    echo -e "${GREEN}[OK]${NC} $*"
-}
+trap 'echo; echo "ERROR: installer failed at line $LINENO"; exit 1' ERR
 
-warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $*"
-}
+# ------------------------------------------------------------
+# ROOT
+# ------------------------------------------------------------
 
-error() {
-    echo -e "${RED}[ERROR]${NC} $*"
-}
+if [[ "${EUID}" -ne 0 ]]; then
+    die "Run this script as root."
+fi
 
-# ============================================================
-# ERROR HANDLING
-# ============================================================
+# ------------------------------------------------------------
+# OS DETECTION
+# ------------------------------------------------------------
 
-set -o pipefail
+source /etc/os-release
 
-FAILED_STEPS=()
-COMPLETED_STEPS=()
-REBOOT_REQUIRED="NO"
+OS_NAME="${PRETTY_NAME:-unknown}"
+OS_ID="${ID:-unknown}"
+CODENAME="${VERSION_CODENAME:-}"
+
+log "XanMod Kernel Installer"
+
+echo "Detected:"
+echo "  OS:       ${OS_NAME}"
+echo "  Codename: ${CODENAME}"
+echo
+
+if [[ "${OS_ID}" != "ubuntu" ]]; then
+    die "This installer supports Ubuntu only."
+fi
+
+if [[ "${CODENAME}" != "noble" ]]; then
+    die "This installer currently targets Ubuntu 24.04 (noble)."
+fi
+
+# ------------------------------------------------------------
+# 1. CLEAN OLD XANMOD REPOSITORIES
+# ------------------------------------------------------------
+
+echo "[1/6] Cleaning old XanMod repositories..."
+echo
+
+# Remove known XanMod list
+rm -f "${XANMOD_LIST}"
+
+# Remove any XanMod repository lines from other .list files
+if [[ -d /etc/apt/sources.list.d ]]; then
+    while IFS= read -r file; do
+        [[ -f "$file" ]] || continue
+
+        if grep -q "deb.xanmod.org" "$file" 2>/dev/null; then
+            echo "Removing old XanMod entries from: $file"
+
+            sed -i '/deb\.xanmod\.org/d' "$file"
+
+            # Remove empty files
+            if [[ ! -s "$file" ]]; then
+                rm -f "$file"
+            fi
+        fi
+    done < <(find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \))
+fi
+
+# Also clean old XanMod entries from the main sources.list
+if [[ -f /etc/apt/sources.list ]]; then
+    if grep -q "deb.xanmod.org" /etc/apt/sources.list 2>/dev/null; then
+        echo "Removing old XanMod entries from /etc/apt/sources.list"
+        sed -i '/deb\.xanmod\.org/d' /etc/apt/sources.list
+    fi
+fi
+
+echo
+echo "Old XanMod repositories cleaned."
+
+# ------------------------------------------------------------
+# 2. DEPENDENCIES
+# ------------------------------------------------------------
+
+echo
+echo "[2/6] Installing dependencies..."
+echo
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    curl \
+    gnupg \
+    lsb-release \
+    apt-transport-https
+
+# ------------------------------------------------------------
+# 3. CPU COMPATIBILITY
+# ------------------------------------------------------------
+
+echo
+echo "[3/6] Checking CPU compatibility..."
+echo
+
+CPU_CHECK="$(mktemp)"
 
 cleanup() {
-    rm -rf "$TMP_DIR" 2>/dev/null || true
+    rm -f "${CPU_CHECK}"
 }
 
 trap cleanup EXIT
 
-# ============================================================
-# ROOT CHECK
-# ============================================================
-
-if [[ "${EUID}" -ne 0 ]]; then
-    error "This installer must be run as root."
-    exit 1
-fi
-
-# ============================================================
-# OS CHECK
-# ============================================================
-
-if [[ ! -f /etc/os-release ]]; then
-    error "Cannot determine operating system."
-    exit 1
-fi
-
-source /etc/os-release
-
-if [[ "${ID}" != "ubuntu" ]]; then
-    error "This installer supports Ubuntu only."
-    error "Detected OS: ${PRETTY_NAME:-unknown}"
-    exit 1
-fi
-
-# ============================================================
-# SYSTEM INFORMATION
-# ============================================================
-
-echo
-echo "============================================================"
-echo " VPS INSTALLER v${SCRIPT_VERSION}"
-echo "============================================================"
-echo
-
-log "Starting VPS installer."
-log "Operating system: ${PRETTY_NAME}"
-log "Kernel: $(uname -r)"
-log "Architecture: $(uname -m)"
-log "Hostname: $(hostname)"
-
-if [[ "$(uname -m)" != "x86_64" ]]; then
-    warning "Architecture is not x86_64: $(uname -m)"
-fi
-
-echo
-
-# ============================================================
-# APT / DPKG LOCK HANDLING
-# ============================================================
-
-wait_for_apt() {
-    local timeout=600
-    local elapsed=0
-
-    info "Checking for running APT/dpkg processes..."
-
-    while true; do
-        if ! pgrep -x apt >/dev/null 2>&1 \
-            && ! pgrep -x apt-get >/dev/null 2>&1 \
-            && ! pgrep -x dpkg >/dev/null 2>&1 \
-            && ! pgrep -x unattended-upgrade >/dev/null 2>&1; then
-            break
-        fi
-
-        if [[ "$elapsed" -ge "$timeout" ]]; then
-            error "APT/dpkg is still busy after ${timeout} seconds."
-            return 1
-        fi
-
-        warning "APT/dpkg is currently busy. Waiting..."
-
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
-
-    elapsed=0
-
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
-        || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
-        || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
-        || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
-
-        if [[ "$elapsed" -ge "$timeout" ]]; then
-            error "APT/dpkg locks are still held after ${timeout} seconds."
-            return 1
-        fi
-
-        warning "APT lock is still held. Waiting..."
-
-        sleep 5
-        elapsed=$((elapsed + 5))
-    done
-
-    success "APT/dpkg is available."
-    return 0
-}
-
-# ============================================================
-# APT INITIALIZATION
-# ============================================================
-
-echo
-echo "============================================================"
-echo " INITIAL SYSTEM UPDATE"
-echo "============================================================"
-echo
-
-wait_for_apt || exit 1
-
-log "Running apt-get update..."
-
-if ! DEBIAN_FRONTEND=noninteractive apt-get update; then
-    error "apt-get update failed."
-    exit 1
-fi
-
-wait_for_apt || exit 1
-
-log "Installing required packages..."
-
-if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl \
-    wget \
-    ca-certificates \
-    gnupg \
-    lsb-release \
-    apt-transport-https; then
-
-    error "Failed to install required packages."
-    exit 1
-fi
-
-wait_for_apt || exit 1
-
-log "Running initial system upgrade..."
-
-if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
-    error "apt-get upgrade failed."
-    exit 1
-fi
-
-success "Initial system update completed."
-
-# ============================================================
-# SSH PUBLIC KEY
-# ============================================================
-
-echo
-echo "============================================================"
-echo " SSH PUBLIC KEY"
-echo "============================================================"
-echo
-
-SSH_DIR="/root/.ssh"
-AUTHORIZED_KEYS="${SSH_DIR}/authorized_keys"
-
-mkdir -p "$SSH_DIR"
-chmod 700 "$SSH_DIR"
-
-if [[ -f "$AUTHORIZED_KEYS" ]] && grep -Eq \
-    '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256) ' \
-    "$AUTHORIZED_KEYS"; then
-
-    success "A valid SSH public key already exists."
+if ! wget -qO "${CPU_CHECK}" "${CPU_CHECK_URL}"; then
+    echo "WARNING: Could not download XanMod CPU checker."
+    echo "Falling back to x64v2."
+    XANMOD_PACKAGE="linux-xanmod-x64v2"
 else
-    warning "No SSH public key was found for root."
+    chmod +x "${CPU_CHECK}"
 
-    echo
-    echo "Paste your SSH public key below."
-    echo "Example:"
-    echo "ssh-ed25519 AAAA... user@computer"
-    echo
+    CPU_RESULT="$(
+        bash "${CPU_CHECK}" 2>&1 || true
+    )"
 
-    while true; do
-        read -r -p "SSH public key: " SSH_PUBLIC_KEY
-
-        if [[ -z "$SSH_PUBLIC_KEY" ]]; then
-            warning "SSH key cannot be empty."
-            continue
-        fi
-
-        if [[ "$SSH_PUBLIC_KEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)[[:space:]]+ ]]; then
-
-            touch "$AUTHORIZED_KEYS"
-
-            if ! grep -Fqx "$SSH_PUBLIC_KEY" "$AUTHORIZED_KEYS"; then
-                echo "$SSH_PUBLIC_KEY" >> "$AUTHORIZED_KEYS"
-            fi
-
-            chmod 600 "$AUTHORIZED_KEYS"
-
-            success "SSH public key added."
-            break
-        else
-            warning "The key format does not look like a valid SSH public key."
-            warning "Please paste the complete public key."
-        fi
-    done
-fi
-
-# ============================================================
-# SSH CONFIG BACKUP
-# ============================================================
-
-if [[ -f /etc/ssh/sshd_config ]]; then
-    SSH_BACKUP="${BACKUP_DIR}/sshd_config.$(date '+%Y%m%d-%H%M%S').bak"
-
-    cp -a /etc/ssh/sshd_config "$SSH_BACKUP"
-
-    success "SSH configuration backed up:"
-    echo "  $SSH_BACKUP"
-fi
-
-# ============================================================
-# EXTERNAL SCRIPT RUNNER
-# ============================================================
-
-run_step() {
-    local name="$1"
-    local url="$2"
-    shift 2
-
-    local step_log="${LOG_DIR}/${name}.log"
-    local tmp_script="${TMP_DIR}/${name}.sh"
-
-    echo
-    echo "============================================================"
-    echo " ${name}"
-    echo "============================================================"
+    echo "CPU compatibility result:"
+    echo "${CPU_RESULT}"
     echo
 
-    log "Starting step: ${name}"
-    log "Source: ${url}"
+    # XanMod supports:
+    # v2 -> x64v2
+    # v3 -> x64v3
+    # v4 -> x64v3 (v4 has no kernel benefit)
 
-    : > "$step_log"
+    if echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v4|x86_64-v4'; then
+        CPU_LEVEL="x86-64-v4"
+        XANMOD_PACKAGE="linux-xanmod-x64v3"
 
-    if ! curl -fLsS \
-        --retry 3 \
-        --retry-delay 2 \
-        --connect-timeout 15 \
-        --max-time 1800 \
-        "$url" \
-        -o "$tmp_script"; then
+    elif echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v3|x86_64-v3'; then
+        CPU_LEVEL="x86-64-v3"
+        XANMOD_PACKAGE="linux-xanmod-x64v3"
 
-        error "${name}: failed to download script."
+    elif echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v2|x86_64-v2'; then
+        CPU_LEVEL="x86-64-v2"
+        XANMOD_PACKAGE="linux-xanmod-x64v2"
 
-        FAILED_STEPS+=("$name")
-
-        rm -f "$tmp_script"
-
-        return 1
-    fi
-
-    if [[ ! -s "$tmp_script" ]]; then
-        error "${name}: downloaded script is empty."
-
-        FAILED_STEPS+=("$name")
-
-        rm -f "$tmp_script"
-
-        return 1
-    fi
-
-    chmod 700 "$tmp_script"
-
-    if ! bash -n "$tmp_script" >> "$step_log" 2>&1; then
-        error "${name}: downloaded script has invalid Bash syntax."
-        error "See log: ${step_log}"
-
-        cat "$step_log"
-
-        FAILED_STEPS+=("$name")
-
-        rm -f "$tmp_script"
-
-        return 1
-    fi
-
-    log "Executing ${name}..."
-
-    bash "$tmp_script" "$@" 2>&1 | tee -a "$step_log"
-
-    local exit_code=${PIPESTATUS[0]}
-
-    rm -f "$tmp_script"
-
-    if [[ "$exit_code" -eq 0 ]]; then
-        success "${name}: completed successfully."
-        COMPLETED_STEPS+=("$name")
-        return 0
-    fi
-
-    error "${name}: failed with exit code ${exit_code}."
-    error "See log: ${step_log}"
-
-    FAILED_STEPS+=("$name")
-
-    return "$exit_code"
-}
-
-# ============================================================
-# INSTALLATION STEPS
-# ============================================================
-
-echo
-echo "============================================================"
-echo " INSTALLATION"
-echo "============================================================"
-echo
-
-INSTALL_FAILED=0
-
-# ------------------------------------------------------------
-# 01 - BBRv3
-# ------------------------------------------------------------
-
-run_step \
-    "01-bbrv3" \
-    "https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh" \
-    --ipv4 || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 02 - SSH PORT
-# ------------------------------------------------------------
-
-run_step \
-    "02-ssh-port" \
-    "https://dignezzz.github.io/server/ssh-port.sh" || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 03 - DASHBOARD
-# ------------------------------------------------------------
-
-run_step \
-    "03-dashboard" \
-    "https://dignezzz.github.io/server/dashboard.sh" || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 04 - SWAP
-# ------------------------------------------------------------
-
-run_step \
-    "04-swap" \
-    "https://dignezzz.github.io/server/swap.sh" || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 05 - FAIL2BAN
-# ------------------------------------------------------------
-
-run_step \
-    "05-f2b" \
-    "https://dignezzz.github.io/server/f2b.sh" || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 06 - SECURITY
-# ------------------------------------------------------------
-
-run_step \
-    "06-security" \
-    "https://dignezzz.github.io/server/security.sh" || INSTALL_FAILED=1
-
-# ------------------------------------------------------------
-# 07 - REMNANODE
-# ------------------------------------------------------------
-
-run_step \
-    "07-remnanode" \
-    "https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh" \
-    @ install || INSTALL_FAILED=1
-
-# ============================================================
-# FINAL APT UPDATE
-# ============================================================
-
-echo
-echo "============================================================"
-echo " FINAL SYSTEM UPDATE"
-echo "============================================================"
-echo
-
-if wait_for_apt; then
-
-    log "Running final apt-get update..."
-
-    if ! DEBIAN_FRONTEND=noninteractive apt-get update; then
-        warning "Final apt-get update failed."
-        INSTALL_FAILED=1
-    fi
-
-    if wait_for_apt; then
-        log "Running final apt-get upgrade..."
-
-        if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
-            warning "Final apt-get upgrade failed."
-            INSTALL_FAILED=1
-        fi
     else
-        warning "Could not obtain APT lock for final upgrade."
-        INSTALL_FAILED=1
+        CPU_LEVEL="unknown"
+        XANMOD_PACKAGE="linux-xanmod-x64v2"
+
+        echo "WARNING: Could not determine CPU level."
+        echo "Falling back to x64v2."
     fi
-
-else
-    warning "Could not obtain APT lock for final update."
-    INSTALL_FAILED=1
 fi
 
-# ============================================================
-# REBOOT CHECK
-# ============================================================
+echo
+echo "Selected:"
+echo "  CPU level: ${CPU_LEVEL:-unknown}"
+echo "  Package:   ${XANMOD_PACKAGE}"
+echo
 
-if [[ -f /var/run/reboot-required ]]; then
-    REBOOT_REQUIRED="YES"
+# ------------------------------------------------------------
+# 4. INSTALL OFFICIAL XANMOD REPOSITORY
+# ------------------------------------------------------------
+
+echo "[4/6] Installing official XanMod repository..."
+echo
+
+mkdir -p /etc/apt/keyrings
+
+wget -qO- "${XANMOD_KEY_URL}" \
+    | gpg --dearmor --yes -o "${XANMOD_KEYRING}"
+
+chmod 0644 "${XANMOD_KEYRING}"
+
+cat > "${XANMOD_LIST}" <<EOF
+deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO} ${CODENAME} main
+EOF
+
+echo "Repository:"
+cat "${XANMOD_LIST}"
+echo
+
+# ------------------------------------------------------------
+# 5. INSTALL XANMOD
+# ------------------------------------------------------------
+
+echo "[5/6] Installing XanMod kernel..."
+echo
+
+apt-get update
+
+apt-get install -y "${XANMOD_PACKAGE}"
+
+# Make sure GRUB configuration is current
+if command -v update-grub >/dev/null 2>&1; then
+    update-grub
 fi
 
-# ============================================================
-# SERVICE STATUS
-# ============================================================
+# ------------------------------------------------------------
+# 6. RESULT
+# ------------------------------------------------------------
 
-get_service_status() {
-    local service="$1"
+echo
+echo "[6/6] Installation complete."
+echo
 
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
-        echo "ACTIVE"
-    elif systemctl is-enabled --quiet "$service" 2>/dev/null; then
-        echo "ENABLED / NOT RUNNING"
-    elif systemctl list-unit-files 2>/dev/null | grep -q "^${service}"; then
-        echo "INSTALLED / INACTIVE"
-    else
-        echo "NOT FOUND"
-    fi
-}
+echo "Installed XanMod packages:"
+dpkg -l | grep xanmod || true
 
-# ============================================================
-# SYSTEM STATUS
-# ============================================================
+echo
+echo "Current kernel:"
+uname -r
+
+echo
+echo "XanMod kernels available:"
+dpkg -l | grep -E 'linux-(image|headers).*xanmod' || true
 
 echo
 echo "============================================================"
-echo " FINAL SYSTEM STATUS"
+echo " REBOOT REQUIRED"
 echo "============================================================"
 echo
-
-echo "Hostname       : $(hostname)"
-echo "OS             : ${PRETTY_NAME}"
-echo "Kernel         : $(uname -r)"
-echo "Architecture   : $(uname -m)"
+echo "Run:"
 echo
-
-echo "BBR:"
-if sysctl net.ipv4.tcp_congestion_control 2>/dev/null; then
-    :
-else
-    echo "  Unable to determine"
-fi
-
+echo "  reboot"
 echo
-echo "Swap:"
-if swapon --show --noheadings 2>/dev/null | grep -q .; then
-    swapon --show
-else
-    echo "  No active swap"
-fi
-
+echo "After reboot verify:"
 echo
-echo "SSH:"
-if systemctl is-active --quiet ssh 2>/dev/null \
-    || systemctl is-active --quiet sshd 2>/dev/null; then
-    echo "  SSH service: ACTIVE"
-else
-    echo "  SSH service: NOT ACTIVE"
-fi
-
+echo "  uname -r"
 echo
-echo "Fail2Ban:"
-echo "  $(get_service_status fail2ban)"
-
+echo "Expected output contains:"
 echo
-echo "Docker:"
-echo "  $(get_service_status docker)"
-
-echo
-echo "RemnaNode:"
-if systemctl list-unit-files 2>/dev/null | grep -qi "remnanode"; then
-    echo "  Service detected"
-    systemctl list-units --type=service --all 2>/dev/null | grep -i remnanode || true
-else
-    echo "  Service not detected"
-fi
-
-# ============================================================
-# STEP SUMMARY
-# ============================================================
-
+echo "  xanmod"
 echo
 echo "============================================================"
-echo " INSTALLATION SUMMARY"
-echo "============================================================"
-echo
-
-echo "Completed steps:"
-if [[ "${#COMPLETED_STEPS[@]}" -eq 0 ]]; then
-    echo "  None"
-else
-    for step in "${COMPLETED_STEPS[@]}"; do
-        echo -e "  ${GREEN}[OK]${NC} $step"
-    done
-fi
-
-echo
-
-echo "Failed steps:"
-if [[ "${#FAILED_STEPS[@]}" -eq 0 ]]; then
-    echo -e "  ${GREEN}None${NC}"
-else
-    for step in "${FAILED_STEPS[@]}"; do
-        echo -e "  ${RED}[FAILED]${NC} $step"
-    done
-fi
-
-echo
-echo "Reboot Required: ${REBOOT_REQUIRED}"
-
-echo
-echo "Master log:"
-echo "  ${MASTER_LOG}"
-
-echo
-echo "Individual logs:"
-ls -1 "${LOG_DIR}"/*.log 2>/dev/null || true
-
-echo
-echo "Backups:"
-ls -lah "$BACKUP_DIR" 2>/dev/null || true
-
-echo
-echo "============================================================"
-
-if [[ "$INSTALL_FAILED" -eq 0 ]]; then
-    echo -e "${GREEN}ALL INSTALLATION STEPS COMPLETED${NC}"
-    log "Installation completed successfully."
-else
-    echo -e "${RED}INSTALLATION COMPLETED WITH ERRORS${NC}"
-    log "Installation completed with one or more errors."
-fi
-
-echo "============================================================"
-echo
-
-if [[ "$REBOOT_REQUIRED" == "YES" ]]; then
-    warning "A reboot is required."
-    warning "The VPS will NOT be rebooted automatically."
-fi
-
-if [[ "$INSTALL_FAILED" -ne 0 ]]; then
-    warning "Check individual logs in ${LOG_DIR}."
-    exit 1
-fi
-
-exit 0
