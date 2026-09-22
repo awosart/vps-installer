@@ -3,64 +3,53 @@
 set -Eeuo pipefail
 
 # ============================================================
-# XanMod Kernel Installer for Ubuntu 24.04+
-# Repository: https://github.com/awosart/vps-installer
+# XanMod Kernel Installer
+# Ubuntu 24.04 LTS / noble
+# Repository:
+# https://github.com/awosart/vps-installer
 # ============================================================
 
-readonly XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
-readonly XANMOD_REPO="http://deb.xanmod.org"
-readonly XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
-readonly XANMOD_LIST="/etc/apt/sources.list.d/xanmod-release.list"
-readonly CPU_CHECK_URL="https://dl.xanmod.org/check_x86-64_psabi.sh"
+XANMOD_REPO="http://deb.xanmod.org"
+XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
+XANMOD_CPU_CHECK="https://dl.xanmod.org/check_x86-64_psabi.sh"
 
-log() {
-    echo
-    echo "============================================================"
-    echo " $1"
-    echo "============================================================"
-    echo
-}
+XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+XANMOD_LIST="/etc/apt/sources.list.d/xanmod-release.list"
 
-die() {
-    echo
-    echo "ERROR: $1"
-    echo
-    exit 1
-}
-
-trap 'echo; echo "ERROR: installer failed at line $LINENO"; exit 1' ERR
+echo
+echo "============================================================"
+echo " XanMod Kernel Installer"
+echo "============================================================"
+echo
 
 # ------------------------------------------------------------
 # ROOT
 # ------------------------------------------------------------
 
-if [[ "${EUID}" -ne 0 ]]; then
-    die "Run this script as root."
+if [[ "$EUID" -ne 0 ]]; then
+    echo "ERROR: Run this script as root."
+    exit 1
 fi
 
 # ------------------------------------------------------------
-# OS DETECTION
+# OS
 # ------------------------------------------------------------
 
 source /etc/os-release
 
-OS_NAME="${PRETTY_NAME:-unknown}"
-OS_ID="${ID:-unknown}"
-CODENAME="${VERSION_CODENAME:-}"
-
-log "XanMod Kernel Installer"
-
 echo "Detected:"
-echo "  OS:       ${OS_NAME}"
-echo "  Codename: ${CODENAME}"
+echo "  OS:       ${PRETTY_NAME}"
+echo "  Codename: ${VERSION_CODENAME:-unknown}"
 echo
 
-if [[ "${OS_ID}" != "ubuntu" ]]; then
-    die "This installer supports Ubuntu only."
+if [[ "${ID}" != "ubuntu" ]]; then
+    echo "ERROR: Ubuntu is required."
+    exit 1
 fi
 
-if [[ "${CODENAME}" != "noble" ]]; then
-    die "This installer currently targets Ubuntu 24.04 (noble)."
+if [[ "${VERSION_CODENAME:-}" != "noble" ]]; then
+    echo "ERROR: This installer currently supports Ubuntu 24.04 (noble)."
+    exit 1
 fi
 
 # ------------------------------------------------------------
@@ -70,40 +59,38 @@ fi
 echo "[1/6] Cleaning old XanMod repositories..."
 echo
 
-# Remove known XanMod list
+# Remove known XanMod repository file
 rm -f "${XANMOD_LIST}"
 
-# Remove any XanMod repository lines from other .list files
+# Clean XanMod entries from all .list/.sources files
 if [[ -d /etc/apt/sources.list.d ]]; then
     while IFS= read -r file; do
         [[ -f "$file" ]] || continue
 
         if grep -q "deb.xanmod.org" "$file" 2>/dev/null; then
-            echo "Removing old XanMod entries from: $file"
-
+            echo "Cleaning: ${file}"
             sed -i '/deb\.xanmod\.org/d' "$file"
 
-            # Remove empty files
             if [[ ! -s "$file" ]]; then
                 rm -f "$file"
             fi
         fi
-    done < <(find /etc/apt/sources.list.d -type f \( -name "*.list" -o -name "*.sources" \))
+    done < <(
+        find /etc/apt/sources.list.d \
+            -type f \
+            \( -name "*.list" -o -name "*.sources" \)
+    )
 fi
 
-# Also clean old XanMod entries from the main sources.list
+# Clean main sources.list if necessary
 if [[ -f /etc/apt/sources.list ]]; then
-    if grep -q "deb.xanmod.org" /etc/apt/sources.list 2>/dev/null; then
-        echo "Removing old XanMod entries from /etc/apt/sources.list"
-        sed -i '/deb\.xanmod\.org/d' /etc/apt/sources.list
-    fi
+    sed -i '/deb\.xanmod\.org/d' /etc/apt/sources.list
 fi
 
-echo
-echo "Old XanMod repositories cleaned."
+echo "Old XanMod repositories removed."
 
 # ------------------------------------------------------------
-# 2. DEPENDENCIES
+# 2. INSTALL DEPENDENCIES
 # ------------------------------------------------------------
 
 echo
@@ -114,103 +101,108 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 
-apt-get install -y --no-install-recommends \
+apt-get install -y \
     ca-certificates \
     wget \
     curl \
     gnupg \
-    lsb-release \
-    apt-transport-https
+    lsb-release
 
 # ------------------------------------------------------------
-# 3. CPU COMPATIBILITY
+# 3. CPU DETECTION
 # ------------------------------------------------------------
 
 echo
 echo "[3/6] Checking CPU compatibility..."
 echo
 
-CPU_CHECK="$(mktemp)"
+CPU_CHECK_FILE="$(mktemp)"
 
 cleanup() {
-    rm -f "${CPU_CHECK}"
+    rm -f "${CPU_CHECK_FILE}"
 }
 
 trap cleanup EXIT
 
-if ! wget -qO "${CPU_CHECK}" "${CPU_CHECK_URL}"; then
-    echo "WARNING: Could not download XanMod CPU checker."
-    echo "Falling back to x64v2."
-    XANMOD_PACKAGE="linux-xanmod-x64v2"
-else
-    chmod +x "${CPU_CHECK}"
+CPU_LEVEL="unknown"
+XANMOD_PACKAGE="linux-xanmod-x64v2"
 
-    CPU_RESULT="$(
-        bash "${CPU_CHECK}" 2>&1 || true
-    )"
+if wget -qO "${CPU_CHECK_FILE}" "${XANMOD_CPU_CHECK}"; then
+
+    chmod +x "${CPU_CHECK_FILE}"
+
+    CPU_RESULT="$(bash "${CPU_CHECK_FILE}" 2>&1 || true)"
 
     echo "CPU compatibility result:"
     echo "${CPU_RESULT}"
     echo
 
-    # XanMod supports:
-    # v2 -> x64v2
-    # v3 -> x64v3
-    # v4 -> x64v3 (v4 has no kernel benefit)
+    # XanMod:
+    #
+    # x86-64-v4 -> x64v3
+    # x86-64-v3 -> x64v3
+    # x86-64-v2 -> x64v2
 
-    if echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v4|x86_64-v4'; then
+    if echo "${CPU_RESULT}" | grep -Eqi \
+        'x86-64-v4|x86_64-v4'; then
+
         CPU_LEVEL="x86-64-v4"
         XANMOD_PACKAGE="linux-xanmod-x64v3"
 
-    elif echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v3|x86_64-v3'; then
+    elif echo "${CPU_RESULT}" | grep -Eqi \
+        'x86-64-v3|x86_64-v3'; then
+
         CPU_LEVEL="x86-64-v3"
         XANMOD_PACKAGE="linux-xanmod-x64v3"
 
-    elif echo "${CPU_RESULT}" | grep -Eqi 'x86-64-v2|x86_64-v2'; then
+    elif echo "${CPU_RESULT}" | grep -Eqi \
+        'x86-64-v2|x86_64-v2'; then
+
         CPU_LEVEL="x86-64-v2"
         XANMOD_PACKAGE="linux-xanmod-x64v2"
 
     else
-        CPU_LEVEL="unknown"
-        XANMOD_PACKAGE="linux-xanmod-x64v2"
-
         echo "WARNING: Could not determine CPU level."
         echo "Falling back to x64v2."
     fi
+
+else
+    echo "WARNING: Could not download CPU compatibility checker."
+    echo "Falling back to x64v2."
 fi
 
-echo
 echo "Selected:"
-echo "  CPU level: ${CPU_LEVEL:-unknown}"
+echo "  CPU level: ${CPU_LEVEL}"
 echo "  Package:   ${XANMOD_PACKAGE}"
+
+# ------------------------------------------------------------
+# 4. ADD OFFICIAL XANMOD REPOSITORY
+# ------------------------------------------------------------
+
 echo
-
-# ------------------------------------------------------------
-# 4. INSTALL OFFICIAL XANMOD REPOSITORY
-# ------------------------------------------------------------
-
 echo "[4/6] Installing official XanMod repository..."
 echo
 
 mkdir -p /etc/apt/keyrings
 
 wget -qO- "${XANMOD_KEY_URL}" \
-    | gpg --dearmor --yes -o "${XANMOD_KEYRING}"
+    | gpg --dearmor --yes \
+    -o "${XANMOD_KEYRING}"
 
 chmod 0644 "${XANMOD_KEYRING}"
 
 cat > "${XANMOD_LIST}" <<EOF
-deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO} ${CODENAME} main
+deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO} noble main
 EOF
 
 echo "Repository:"
 cat "${XANMOD_LIST}"
+
+# ------------------------------------------------------------
+# 5. INSTALL KERNEL
+# ------------------------------------------------------------
+
 echo
-
-# ------------------------------------------------------------
-# 5. INSTALL XANMOD
-# ------------------------------------------------------------
-
 echo "[5/6] Installing XanMod kernel..."
 echo
 
@@ -218,13 +210,13 @@ apt-get update
 
 apt-get install -y "${XANMOD_PACKAGE}"
 
-# Make sure GRUB configuration is current
+# Update GRUB if available
 if command -v update-grub >/dev/null 2>&1; then
     update-grub
 fi
 
 # ------------------------------------------------------------
-# 6. RESULT
+# 6. FINISH
 # ------------------------------------------------------------
 
 echo
@@ -232,15 +224,11 @@ echo "[6/6] Installation complete."
 echo
 
 echo "Installed XanMod packages:"
-dpkg -l | grep xanmod || true
+dpkg -l | grep -E 'linux-(image|headers).*xanmod' || true
 
 echo
 echo "Current kernel:"
 uname -r
-
-echo
-echo "XanMod kernels available:"
-dpkg -l | grep -E 'linux-(image|headers).*xanmod' || true
 
 echo
 echo "============================================================"
@@ -249,14 +237,14 @@ echo "============================================================"
 echo
 echo "Run:"
 echo
-echo "  reboot"
+echo "    reboot"
 echo
-echo "After reboot verify:"
+echo "Then verify:"
 echo
-echo "  uname -r"
+echo "    uname -r"
 echo
-echo "Expected output contains:"
+echo "Expected:"
 echo
-echo "  xanmod"
+echo "    kernel version containing xanmod"
 echo
 echo "============================================================"
