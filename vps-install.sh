@@ -5,13 +5,14 @@
 # Ubuntu only
 # ============================================================
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 LOG_DIR="/var/log/vps-setup"
 MASTER_LOG="${LOG_DIR}/install.log"
 BACKUP_DIR="${LOG_DIR}/backup"
+TMP_DIR="/tmp/vps-installer"
 
-mkdir -p "$LOG_DIR" "$BACKUP_DIR"
+mkdir -p "$LOG_DIR" "$BACKUP_DIR" "$TMP_DIR"
 
 # ============================================================
 # COLORS
@@ -31,7 +32,11 @@ NC='\033[0m'
 exec > >(tee -a "$MASTER_LOG") 2>&1
 
 log() {
-    echo -e "${CYAN}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $*"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
 }
 
 success() {
@@ -46,19 +51,27 @@ error() {
     echo -e "${RED}[ERROR]${NC} $*"
 }
 
-section() {
-    echo
-    echo "============================================================"
-    echo -e "${BLUE}$*${NC}"
-    echo "============================================================"
-    echo
+# ============================================================
+# ERROR HANDLING
+# ============================================================
+
+set -o pipefail
+
+FAILED_STEPS=()
+COMPLETED_STEPS=()
+REBOOT_REQUIRED="NO"
+
+cleanup() {
+    rm -rf "$TMP_DIR" 2>/dev/null || true
 }
+
+trap cleanup EXIT
 
 # ============================================================
 # ROOT CHECK
 # ============================================================
 
-if [[ "$(id -u)" -ne 0 ]]; then
+if [[ "${EUID}" -ne 0 ]]; then
     error "This installer must be run as root."
     exit 1
 fi
@@ -68,647 +81,550 @@ fi
 # ============================================================
 
 if [[ ! -f /etc/os-release ]]; then
-    error "/etc/os-release not found."
+    error "Cannot determine operating system."
     exit 1
 fi
 
 source /etc/os-release
 
-if [[ "${ID:-}" != "ubuntu" ]]; then
+if [[ "${ID}" != "ubuntu" ]]; then
     error "This installer supports Ubuntu only."
-    error "Detected: ${PRETTY_NAME:-unknown}"
+    error "Detected OS: ${PRETTY_NAME:-unknown}"
     exit 1
-fi
-
-# ============================================================
-# ARCHITECTURE CHECK
-# ============================================================
-
-ARCH="$(uname -m)"
-
-if [[ "$ARCH" != "x86_64" ]]; then
-    warning "Detected architecture: $ARCH"
-    warning "Some external scripts, especially BBR/XanMod, may not support this architecture."
 fi
 
 # ============================================================
 # SYSTEM INFORMATION
 # ============================================================
 
-section "VPS INSTALLER ${SCRIPT_VERSION}"
+echo
+echo "============================================================"
+echo " VPS INSTALLER v${SCRIPT_VERSION}"
+echo "============================================================"
+echo
 
-echo "Hostname     : $(hostname)"
-echo "OS           : ${PRETTY_NAME}"
-echo "Kernel       : $(uname -r)"
-echo "Architecture : ${ARCH}"
-echo "IPv4         : $(hostname -I 2>/dev/null | awk '{print $1}')"
-echo "Started      : $(date)"
+log "Starting VPS installer."
+log "Operating system: ${PRETTY_NAME}"
+log "Kernel: $(uname -r)"
+log "Architecture: $(uname -m)"
+log "Hostname: $(hostname)"
+
+if [[ "$(uname -m)" != "x86_64" ]]; then
+    warning "Architecture is not x86_64: $(uname -m)"
+fi
+
+echo
 
 # ============================================================
-# APT LOCK WAIT
+# APT / DPKG LOCK HANDLING
 # ============================================================
 
 wait_for_apt() {
+    local timeout=600
+    local elapsed=0
 
-    local TIMEOUT=600
-    local ELAPSED=0
-
-    log "Checking for running APT/dpkg processes..."
+    info "Checking for running APT/dpkg processes..."
 
     while true; do
-
-        if ! pgrep -x apt >/dev/null 2>&1 &&
-           ! pgrep -x apt-get >/dev/null 2>&1 &&
-           ! pgrep -x dpkg >/dev/null 2>&1 &&
-           ! pgrep -x unattended-upgrade >/dev/null 2>&1; then
-
+        if ! pgrep -x apt >/dev/null 2>&1 \
+            && ! pgrep -x apt-get >/dev/null 2>&1 \
+            && ! pgrep -x dpkg >/dev/null 2>&1 \
+            && ! pgrep -x unattended-upgrade >/dev/null 2>&1; then
             break
         fi
 
-        if [[ "$ELAPSED" -eq 0 ]]; then
-            warning "APT/dpkg is currently busy."
-            warning "Waiting for the existing process to finish..."
-        fi
-
-        if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
-            error "APT/dpkg remained busy for more than ${TIMEOUT} seconds."
-            error "The installer will stop without killing the existing process."
+        if [[ "$elapsed" -ge "$timeout" ]]; then
+            error "APT/dpkg is still busy after ${timeout} seconds."
             return 1
         fi
 
+        warning "APT/dpkg is currently busy. Waiting..."
+
         sleep 5
-        ELAPSED=$((ELAPSED + 5))
-
-        if (( ELAPSED % 30 == 0 )); then
-            log "Still waiting for APT/dpkg... ${ELAPSED}s"
-        fi
-
+        elapsed=$((elapsed + 5))
     done
 
-    # Extra safety check for locks.
-    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ||
-          fuser /var/lib/dpkg/lock >/dev/null 2>&1 ||
-          fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    elapsed=0
 
-        if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
-            error "APT lock remained busy for more than ${TIMEOUT} seconds."
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+        || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+        || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+        || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+
+        if [[ "$elapsed" -ge "$timeout" ]]; then
+            error "APT/dpkg locks are still held after ${timeout} seconds."
             return 1
         fi
 
-        sleep 5
-        ELAPSED=$((ELAPSED + 5))
+        warning "APT lock is still held. Waiting..."
 
+        sleep 5
+        elapsed=$((elapsed + 5))
     done
 
     success "APT/dpkg is available."
-
     return 0
 }
 
 # ============================================================
-# INITIAL APT UPDATE
+# APT INITIALIZATION
 # ============================================================
 
-section "INITIAL SYSTEM UPDATE"
+echo
+echo "============================================================"
+echo " INITIAL SYSTEM UPDATE"
+echo "============================================================"
+echo
 
-if ! wait_for_apt; then
-    exit 1
-fi
+wait_for_apt || exit 1
 
 log "Running apt-get update..."
 
-if apt-get update; then
-    success "APT package lists updated."
-else
+if ! DEBIAN_FRONTEND=noninteractive apt-get update; then
     error "apt-get update failed."
     exit 1
 fi
 
-# ============================================================
-# INSTALL BASIC DEPENDENCIES
-# ============================================================
+wait_for_apt || exit 1
 
-section "INSTALLING BASIC DEPENDENCIES"
+log "Installing required packages..."
 
-if ! wait_for_apt; then
+if ! DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    curl \
+    wget \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    apt-transport-https; then
+
+    error "Failed to install required packages."
     exit 1
 fi
 
-log "Installing curl, wget and ca-certificates..."
+wait_for_apt || exit 1
 
-if DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y curl wget ca-certificates; then
+log "Running initial system upgrade..."
 
-    success "Basic dependencies installed."
+if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
+    error "apt-get upgrade failed."
+    exit 1
+fi
 
+success "Initial system update completed."
+
+# ============================================================
+# SSH PUBLIC KEY
+# ============================================================
+
+echo
+echo "============================================================"
+echo " SSH PUBLIC KEY"
+echo "============================================================"
+echo
+
+SSH_DIR="/root/.ssh"
+AUTHORIZED_KEYS="${SSH_DIR}/authorized_keys"
+
+mkdir -p "$SSH_DIR"
+chmod 700 "$SSH_DIR"
+
+if [[ -f "$AUTHORIZED_KEYS" ]] && grep -Eq \
+    '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256) ' \
+    "$AUTHORIZED_KEYS"; then
+
+    success "A valid SSH public key already exists."
 else
+    warning "No SSH public key was found for root."
 
-    error "Failed to install basic dependencies."
-    exit 1
-
-fi
-
-# ============================================================
-# SYSTEM UPGRADE
-# ============================================================
-
-section "INITIAL SYSTEM UPGRADE"
-
-if ! wait_for_apt; then
-    exit 1
-fi
-
-log "Upgrading installed packages..."
-
-if DEBIAN_FRONTEND=noninteractive \
-    apt-get upgrade -y; then
-
-    success "System packages upgraded."
-
-else
-
-    error "APT upgrade failed."
-    exit 1
-
-fi
-
-# ============================================================
-# SSH KEY
-# ============================================================
-
-section "SSH KEY CHECK"
-
-mkdir -p /root/.ssh
-chmod 700 /root/.ssh
-
-AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
-
-touch "$AUTHORIZED_KEYS"
-chmod 600 "$AUTHORIZED_KEYS"
-
-if grep -qE '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-|sk-ssh-ed25519|sk-ecdsa-sha2-)' "$AUTHORIZED_KEYS"; then
-
-    success "An SSH public key already exists."
-
-else
-
-    warning "No SSH public key was found."
     echo
-    echo "Paste your PUBLIC SSH key."
-    echo
+    echo "Paste your SSH public key below."
     echo "Example:"
-    echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@computer"
-    echo
-    echo "Do NOT paste your private key."
+    echo "ssh-ed25519 AAAA... user@computer"
     echo
 
     while true; do
-
         read -r -p "SSH public key: " SSH_PUBLIC_KEY
 
         if [[ -z "$SSH_PUBLIC_KEY" ]]; then
-            warning "No key entered."
+            warning "SSH key cannot be empty."
             continue
         fi
 
-        if [[ "$SSH_PUBLIC_KEY" =~ ^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)[[:space:]] ]]; then
+        if [[ "$SSH_PUBLIC_KEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ssh-ed25519|sk-ecdsa-sha2-nistp256)[[:space:]]+ ]]; then
 
-            echo "$SSH_PUBLIC_KEY" >> "$AUTHORIZED_KEYS"
+            touch "$AUTHORIZED_KEYS"
+
+            if ! grep -Fqx "$SSH_PUBLIC_KEY" "$AUTHORIZED_KEYS"; then
+                echo "$SSH_PUBLIC_KEY" >> "$AUTHORIZED_KEYS"
+            fi
 
             chmod 600 "$AUTHORIZED_KEYS"
 
             success "SSH public key added."
-
             break
-
         else
-
-            error "Invalid SSH public key format."
-            echo "Expected ssh-ed25519, ssh-rsa or ecdsa-sha2-*."
-
+            warning "The key format does not look like a valid SSH public key."
+            warning "Please paste the complete public key."
         fi
-
     done
-
 fi
 
 # ============================================================
-# SSH BACKUP
+# SSH CONFIG BACKUP
 # ============================================================
 
-section "SSH CONFIG BACKUP"
-
 if [[ -f /etc/ssh/sshd_config ]]; then
-
     SSH_BACKUP="${BACKUP_DIR}/sshd_config.$(date '+%Y%m%d-%H%M%S').bak"
 
     cp -a /etc/ssh/sshd_config "$SSH_BACKUP"
 
-    success "SSH configuration backed up."
-
+    success "SSH configuration backed up:"
+    echo "  $SSH_BACKUP"
 fi
 
 # ============================================================
-# RUN EXTERNAL SCRIPT
+# EXTERNAL SCRIPT RUNNER
 # ============================================================
 
 run_step() {
-
-    local NAME="$1"
-    local URL="$2"
-
+    local name="$1"
+    local url="$2"
     shift 2
 
-    local STEP_LOG="${LOG_DIR}/${NAME}.log"
-    local TMP_SCRIPT
-    local START_TIME
-    local END_TIME
-    local DURATION
-    local EXIT_CODE
+    local step_log="${LOG_DIR}/${name}.log"
+    local tmp_script="${TMP_DIR}/${name}.sh"
 
-    START_TIME=$(date +%s)
-
-    section "STEP: ${NAME}"
-
-    echo "URL     : ${URL}"
-    echo "Started : $(date)"
+    echo
+    echo "============================================================"
+    echo " ${name}"
+    echo "============================================================"
     echo
 
-    TMP_SCRIPT="$(mktemp "/tmp/${NAME}.XXXXXX.sh")"
+    log "Starting step: ${name}"
+    log "Source: ${url}"
 
-    log "Downloading script..."
+    : > "$step_log"
 
-    if ! curl -fLsS --retry 3 --connect-timeout 15 \
-        "$URL" -o "$TMP_SCRIPT"; then
+    if ! curl -fLsS \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 15 \
+        --max-time 1800 \
+        "$url" \
+        -o "$tmp_script"; then
 
-        error "Failed to download ${NAME}."
-        rm -f "$TMP_SCRIPT"
+        error "${name}: failed to download script."
+
+        FAILED_STEPS+=("$name")
+
+        rm -f "$tmp_script"
 
         return 1
     fi
 
-    if [[ ! -s "$TMP_SCRIPT" ]]; then
+    if [[ ! -s "$tmp_script" ]]; then
+        error "${name}: downloaded script is empty."
 
-        error "Downloaded file is empty."
-        rm -f "$TMP_SCRIPT"
+        FAILED_STEPS+=("$name")
+
+        rm -f "$tmp_script"
 
         return 1
     fi
 
-    chmod 700 "$TMP_SCRIPT"
+    chmod 700 "$tmp_script"
 
-    success "Script downloaded."
+    if ! bash -n "$tmp_script" >> "$step_log" 2>&1; then
+        error "${name}: downloaded script has invalid Bash syntax."
+        error "See log: ${step_log}"
 
-    echo
-    echo "------------------------------------------------------------"
-    echo "Running ${NAME}"
-    echo "------------------------------------------------------------"
-    echo
+        cat "$step_log"
 
-    # Run interactively.
-    # Output is simultaneously written to the individual log.
-    bash "$TMP_SCRIPT" "$@" 2>&1 | tee "$STEP_LOG"
+        FAILED_STEPS+=("$name")
 
-    EXIT_CODE=${PIPESTATUS[0]}
+        rm -f "$tmp_script"
 
-    rm -f "$TMP_SCRIPT"
+        return 1
+    fi
 
-    END_TIME=$(date +%s)
-    DURATION=$((END_TIME - START_TIME))
+    log "Executing ${name}..."
 
-    echo
-    echo "Finished : $(date)"
-    echo "Duration : ${DURATION}s"
-    echo "Exit code: ${EXIT_CODE}"
+    bash "$tmp_script" "$@" 2>&1 | tee -a "$step_log"
 
-    if [[ "$EXIT_CODE" -eq 0 ]]; then
+    local exit_code=${PIPESTATUS[0]}
 
-        success "${NAME} completed."
+    rm -f "$tmp_script"
 
+    if [[ "$exit_code" -eq 0 ]]; then
+        success "${name}: completed successfully."
+        COMPLETED_STEPS+=("$name")
         return 0
-
-    else
-
-        error "${NAME} exited with code ${EXIT_CODE}."
-
-        return "$EXIT_CODE"
-
     fi
+
+    error "${name}: failed with exit code ${exit_code}."
+    error "See log: ${step_log}"
+
+    FAILED_STEPS+=("$name")
+
+    return "$exit_code"
 }
 
 # ============================================================
-# STEP 01 — BBRv3
+# INSTALLATION STEPS
 # ============================================================
 
-if ! run_step \
+echo
+echo "============================================================"
+echo " INSTALLATION"
+echo "============================================================"
+echo
+
+INSTALL_FAILED=0
+
+# ------------------------------------------------------------
+# 01 - BBRv3
+# ------------------------------------------------------------
+
+run_step \
     "01-bbrv3" \
     "https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh" \
-    --ipv4; then
+    --ipv4 || INSTALL_FAILED=1
 
-    error "Installation stopped at BBRv3."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 02 - SSH PORT
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 02 — SSH PORT
-# ============================================================
-
-if ! run_step \
+run_step \
     "02-ssh-port" \
-    "https://dignezzz.github.io/server/ssh-port.sh"; then
+    "https://dignezzz.github.io/server/ssh-port.sh" || INSTALL_FAILED=1
 
-    error "Installation stopped at SSH port configuration."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 03 - DASHBOARD
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 03 — DASHBOARD
-# ============================================================
-
-if ! run_step \
+run_step \
     "03-dashboard" \
-    "https://dignezzz.github.io/server/dashboard.sh"; then
+    "https://dignezzz.github.io/server/dashboard.sh" || INSTALL_FAILED=1
 
-    error "Installation stopped at Dashboard."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 04 - SWAP
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 04 — SWAP
-# ============================================================
-
-if ! run_step \
+run_step \
     "04-swap" \
-    "https://dignezzz.github.io/server/swap.sh"; then
+    "https://dignezzz.github.io/server/swap.sh" || INSTALL_FAILED=1
 
-    error "Installation stopped at Swap."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 05 - FAIL2BAN
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 05 — FAIL2BAN
-# ============================================================
-
-if ! run_step \
+run_step \
     "05-f2b" \
-    "https://dignezzz.github.io/server/f2b.sh"; then
+    "https://dignezzz.github.io/server/f2b.sh" || INSTALL_FAILED=1
 
-    error "Installation stopped at Fail2Ban."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 06 - SECURITY
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 06 — SECURITY
-# ============================================================
-
-if ! run_step \
+run_step \
     "06-security" \
-    "https://dignezzz.github.io/server/security.sh"; then
+    "https://dignezzz.github.io/server/security.sh" || INSTALL_FAILED=1
 
-    error "Installation stopped at Security."
-    exit 1
-fi
+# ------------------------------------------------------------
+# 07 - REMNANODE
+# ------------------------------------------------------------
 
-# ============================================================
-# STEP 07 — REMNANODE
-# ============================================================
-
-if ! run_step \
+run_step \
     "07-remnanode" \
     "https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh" \
-    @ install; then
-
-    error "Installation stopped at RemnaNode."
-    exit 1
-fi
+    @ install || INSTALL_FAILED=1
 
 # ============================================================
 # FINAL APT UPDATE
 # ============================================================
 
-section "FINAL SYSTEM UPDATE"
+echo
+echo "============================================================"
+echo " FINAL SYSTEM UPDATE"
+echo "============================================================"
+echo
 
-if ! wait_for_apt; then
-    warning "Could not obtain APT lock for final update."
-else
+if wait_for_apt; then
 
     log "Running final apt-get update..."
 
-    if apt-get update; then
-        success "Final APT update completed."
-    else
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update; then
         warning "Final apt-get update failed."
+        INSTALL_FAILED=1
     fi
 
-    if ! wait_for_apt; then
-
-        warning "Could not obtain APT lock for final upgrade."
-
-    else
-
+    if wait_for_apt; then
         log "Running final apt-get upgrade..."
 
-        if DEBIAN_FRONTEND=noninteractive \
-            apt-get upgrade -y; then
-
-            success "Final system upgrade completed."
-
-        else
-
+        if ! DEBIAN_FRONTEND=noninteractive apt-get upgrade -y; then
             warning "Final apt-get upgrade failed."
-
+            INSTALL_FAILED=1
         fi
-
+    else
+        warning "Could not obtain APT lock for final upgrade."
+        INSTALL_FAILED=1
     fi
 
+else
+    warning "Could not obtain APT lock for final update."
+    INSTALL_FAILED=1
 fi
 
 # ============================================================
-# REBOOT REQUIRED CHECK
+# REBOOT CHECK
 # ============================================================
-
-section "REBOOT CHECK"
-
-REBOOT_REQUIRED="NO"
 
 if [[ -f /var/run/reboot-required ]]; then
     REBOOT_REQUIRED="YES"
 fi
 
-if [[ -f /var/run/reboot-required.pkgs ]]; then
-    REBOOT_REQUIRED="YES"
-fi
-
-if [[ "$REBOOT_REQUIRED" == "YES" ]]; then
-
-    warning "A reboot is required."
-    warning "The installer will NOT reboot the server automatically."
-
-else
-
-    success "No reboot is currently required."
-
-fi
-
 # ============================================================
-# FINAL REPORT
+# SERVICE STATUS
 # ============================================================
 
-section "FINAL REPORT"
+get_service_status() {
+    local service="$1"
 
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        echo "ACTIVE"
+    elif systemctl is-enabled --quiet "$service" 2>/dev/null; then
+        echo "ENABLED / NOT RUNNING"
+    elif systemctl list-unit-files 2>/dev/null | grep -q "^${service}"; then
+        echo "INSTALLED / INACTIVE"
+    else
+        echo "NOT FOUND"
+    fi
+}
+
+# ============================================================
+# SYSTEM STATUS
+# ============================================================
+
+echo
 echo "============================================================"
-echo "VPS INSTALLER"
+echo " FINAL SYSTEM STATUS"
 echo "============================================================"
 echo
-echo "Version      : ${SCRIPT_VERSION}"
-echo "Status       : SUCCESS"
-echo "Finished     : $(date)"
+
+echo "Hostname       : $(hostname)"
+echo "OS             : ${PRETTY_NAME}"
+echo "Kernel         : $(uname -r)"
+echo "Architecture   : $(uname -m)"
 echo
 
-echo "SYSTEM"
-echo "------------------------------------------------------------"
-echo "Hostname     : $(hostname)"
-echo "OS           : ${PRETTY_NAME}"
-echo "Kernel       : $(uname -r)"
-echo "Architecture : $(uname -m)"
-echo "IPv4         : $(hostname -I 2>/dev/null | awk '{print $1}')"
-echo
-
-echo "SSH"
-echo "------------------------------------------------------------"
-
-if [[ -s "$AUTHORIZED_KEYS" ]]; then
-
-    SSH_KEY_COUNT=$(grep -cE \
-        '^(ssh-rsa|ssh-ed25519|ecdsa-sha2-|sk-ssh)' \
-        "$AUTHORIZED_KEYS" 2>/dev/null || true)
-
-    echo "Authorized keys : ${SSH_KEY_COUNT}"
-
-else
-
-    echo "Authorized keys : 0"
-
-fi
-
-if systemctl is-active --quiet ssh 2>/dev/null ||
-   systemctl is-active --quiet sshd 2>/dev/null; then
-
-    echo "SSH service     : active"
-
-else
-
-    echo "SSH service     : not detected"
-
-fi
-
-echo
-
-echo "FAIL2BAN"
-echo "------------------------------------------------------------"
-
-if command -v fail2ban-client >/dev/null 2>&1; then
-
-    fail2ban-client ping 2>/dev/null || true
-
-else
-
-    echo "fail2ban-client : not found"
-
-fi
-
-echo
-
-echo "SWAP"
-echo "------------------------------------------------------------"
-
-free -h | grep -i swap || true
-
-echo
-
-echo "NETWORK"
-echo "------------------------------------------------------------"
-
+echo "BBR:"
 if sysctl net.ipv4.tcp_congestion_control 2>/dev/null; then
-    true
+    :
 else
-    echo "TCP congestion control information unavailable."
+    echo "  Unable to determine"
+fi
+
+echo
+echo "Swap:"
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    swapon --show
+else
+    echo "  No active swap"
+fi
+
+echo
+echo "SSH:"
+if systemctl is-active --quiet ssh 2>/dev/null \
+    || systemctl is-active --quiet sshd 2>/dev/null; then
+    echo "  SSH service: ACTIVE"
+else
+    echo "  SSH service: NOT ACTIVE"
+fi
+
+echo
+echo "Fail2Ban:"
+echo "  $(get_service_status fail2ban)"
+
+echo
+echo "Docker:"
+echo "  $(get_service_status docker)"
+
+echo
+echo "RemnaNode:"
+if systemctl list-unit-files 2>/dev/null | grep -qi "remnanode"; then
+    echo "  Service detected"
+    systemctl list-units --type=service --all 2>/dev/null | grep -i remnanode || true
+else
+    echo "  Service not detected"
+fi
+
+# ============================================================
+# STEP SUMMARY
+# ============================================================
+
+echo
+echo "============================================================"
+echo " INSTALLATION SUMMARY"
+echo "============================================================"
+echo
+
+echo "Completed steps:"
+if [[ "${#COMPLETED_STEPS[@]}" -eq 0 ]]; then
+    echo "  None"
+else
+    for step in "${COMPLETED_STEPS[@]}"; do
+        echo -e "  ${GREEN}[OK]${NC} $step"
+    done
 fi
 
 echo
 
-echo "DOCKER"
-echo "------------------------------------------------------------"
-
-if command -v docker >/dev/null 2>&1; then
-
-    docker --version
-
-    echo "Docker service:"
-    systemctl is-active docker 2>/dev/null || true
-
+echo "Failed steps:"
+if [[ "${#FAILED_STEPS[@]}" -eq 0 ]]; then
+    echo -e "  ${GREEN}None${NC}"
 else
-
-    echo "Docker : not installed"
-
+    for step in "${FAILED_STEPS[@]}"; do
+        echo -e "  ${RED}[FAILED]${NC} $step"
+    done
 fi
 
 echo
-
-echo "REMNANODE"
-echo "------------------------------------------------------------"
-
-if command -v remnanode >/dev/null 2>&1; then
-
-    echo "remnanode command : installed"
-
-    remnanode status 2>/dev/null || true
-
-else
-
-    echo "remnanode command : not found"
-
-fi
+echo "Reboot Required: ${REBOOT_REQUIRED}"
 
 echo
-
-echo "REBOOT"
-echo "------------------------------------------------------------"
-echo "Required : ${REBOOT_REQUIRED}"
-
-echo
-
-echo "LOGS"
-echo "------------------------------------------------------------"
-
 echo "Master log:"
 echo "  ${MASTER_LOG}"
 
 echo
 echo "Individual logs:"
-
 ls -1 "${LOG_DIR}"/*.log 2>/dev/null || true
 
 echo
-
 echo "Backups:"
-
 ls -lah "$BACKUP_DIR" 2>/dev/null || true
 
 echo
-
 echo "============================================================"
-echo -e "${GREEN}ALL INSTALLATION STEPS COMPLETED${NC}"
+
+if [[ "$INSTALL_FAILED" -eq 0 ]]; then
+    echo -e "${GREEN}ALL INSTALLATION STEPS COMPLETED${NC}"
+    log "Installation completed successfully."
+else
+    echo -e "${RED}INSTALLATION COMPLETED WITH ERRORS${NC}"
+    log "Installation completed with one or more errors."
+fi
+
 echo "============================================================"
 echo
 
-log "Installation completed."
-```
+if [[ "$REBOOT_REQUIRED" == "YES" ]]; then
+    warning "A reboot is required."
+    warning "The VPS will NOT be rebooted automatically."
+fi
 
-**После замены файла в GitHub** запускай на новом VPS:
+if [[ "$INSTALL_FAILED" -ne 0 ]]; then
+    warning "Check individual logs in ${LOG_DIR}."
+    exit 1
+fi
 
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/awosart/vps-installer/main/vps-install.sh)
-```
-
-И теперь при занятом `apt` он не будет ломиться в `dpkg`: будет ждать освобождения блокировки до **10 минут**, после чего корректно остановится. Кроме того, если BBR потребует reboot, установщик **не будет сам перезагружать VPS** — в конце просто покажет `Reboot Required: YES`.
+exit 0
