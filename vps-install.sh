@@ -14,12 +14,9 @@
 #
 # Env (for unattended mode):
 #   SSH_PUBLIC_KEY="ssh-ed25519 AAAA..."
-#   PANEL_IP="1.2.3.4"
-#   NODE_PORT="2222"
-#   UFW_EXTRA_PORTS="443,8443/tcp"
 # ============================================================
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.6.0"
 
 set -o pipefail
 
@@ -32,7 +29,6 @@ MASTER_LOG="${LOG_DIR}/install.log"
 BACKUP_DIR="${LOG_DIR}/backup"
 
 REMNANODE_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
-REMNANODE_ENV="/opt/remnanode/.env"
 BBRV3_URL="https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh"
 DIGNEZZZ_BASE="https://dignezzz.github.io/server"
 
@@ -59,7 +55,7 @@ Usage: vps-install.sh [--lang ru|en] [-y|--yes] [-h|--help]
   --lang ru|en   interface language / язык интерфейса
   -y, --yes      accept defaults / ответы по умолчанию
 
-Env: SSH_PUBLIC_KEY, PANEL_IP, NODE_PORT, UFW_EXTRA_PORTS
+Env: SSH_PUBLIC_KEY
 EOF_USAGE
     exit 0
 }
@@ -338,14 +334,6 @@ get_ssh_ports() {
         "$sshd_bin" -T 2>/dev/null | awk '$1 == "port" { print $2 }'
         ss -Htlnp 2>/dev/null | awk '/"sshd"/ { n = split($4, a, ":"); print a[n] }'
     } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' '
-}
-
-get_node_port() {
-    local value=""
-    if [[ -f "$REMNANODE_ENV" ]]; then
-        value="$(grep -E '^(NODE_PORT|APP_PORT)=' "$REMNANODE_ENV" | head -n1 | cut -d= -f2 | tr -d "\"' ")"
-    fi
-    echo "${value:-$NODE_PORT}"
 }
 
 # ============================================================
@@ -723,60 +711,51 @@ EOF
 }
 
 # ============================================================
-# STEP: UFW
+# STEP: UFW (только установка; правила настраивает security.sh)
 # ============================================================
 
 ensure_ufw() {
-    local p
-
-    if ! command -v ufw >/dev/null 2>&1; then
-        warning "$(L "UFW не установлен, устанавливаю..." "UFW is not installed, installing...")"
-        apt_get install ufw || return 1
-    else
+    if command -v ufw >/dev/null 2>&1; then
         success "$(L "UFW уже установлен." "UFW is already installed.")"
+        return 0
     fi
-
-    for p in $(get_ssh_ports); do
-        ufw allow "${p}/tcp" comment 'SSH' >/dev/null
-    done
-    return 0
+    warning "$(L "UFW не установлен, устанавливаю..." "UFW is not installed, installing...")"
+    apt_get install ufw
 }
 
-configure_ufw() {
-    local p node_port
+# Проверка, что Fail2Ban следит за актуальным SSH-портом.
+check_f2b_ssh_port() {
+    local ssh_ports jail_ports p ok=1
+    command -v fail2ban-client >/dev/null 2>&1 || return 0
 
-    ensure_ufw || return 1
+    ssh_ports="$(get_ssh_ports)"
+    jail_ports="$(cat /etc/fail2ban/jail.local /etc/fail2ban/jail.d/*.conf /etc/fail2ban/jail.d/*.local 2>/dev/null \
+        | awk '/^\[/{sec=$0} sec ~ /^\[sshd\]/ && /^[[:space:]]*port[[:space:]]*=/ { sub(/^[^=]*=[[:space:]]*/, ""); print }' \
+        | tail -n1)"
 
-    for p in $(get_ssh_ports); do
-        info "$(L "SSH-порт" "SSH port") ${p}/tcp -> allow"
-        ufw allow "${p}/tcp" comment 'SSH'
-    done
-
-    node_port="$(get_node_port)"
-    if [[ -n "$node_port" ]]; then
-        if [[ -n "$PANEL_IP" ]]; then
-            info "$(L "Порт ноды" "Node port") ${node_port}/tcp -> $(L "только с" "only from") ${PANEL_IP}"
-            ufw allow from "$PANEL_IP" to any port "$node_port" proto tcp comment 'Remnawave panel'
-        else
-            info "$(L "Порт ноды" "Node port") ${node_port}/tcp -> $(L "открыт для всех" "open to everyone")"
-            ufw allow "${node_port}/tcp" comment 'Remnanode'
-        fi
+    if ! fail2ban-client status sshd >/dev/null 2>&1; then
+        warning "$(L "Jail sshd в Fail2Ban не активен." "Fail2Ban sshd jail is not active.")"
+        return 1
     fi
 
-    for p in ${UFW_EXTRA_PORTS//,/ }; do
-        if [[ "$p" =~ ^[0-9]{1,5}(:[0-9]{1,5})?(/(tcp|udp))?$ ]]; then
-            info "$(L "Доп. порт" "Extra port") ${p} -> allow"
-            ufw allow "$p" comment 'extra'
-        else
-            warning "$(L "Некорректный порт" "Invalid port") '${p}', $(L "пропуск" "skipped")."
+    info "$(L "SSH-порт(ы)" "SSH port(s)"): ${ssh_ports}  |  Fail2Ban sshd port: ${jail_ports:-ssh (22)}"
+
+    for p in $ssh_ports; do
+        if [[ -z "$jail_ports" ]]; then
+            [[ "$p" == "22" ]] || ok=0
+        elif ! grep -Eq "(^|[^0-9])${p}([^0-9]|$)" <<<"$jail_ports"; then
+            ok=0
         fi
     done
 
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw --force enable || return 1
-    ufw status verbose
-    return 0
+    if [[ "$ok" -eq 1 ]]; then
+        success "$(L "Fail2Ban следит за актуальным SSH-портом." "Fail2Ban watches the current SSH port.")"
+        return 0
+    fi
+
+    warning "$(L "Fail2Ban НЕ следит за текущим SSH-портом. Проверьте секцию [sshd] в /etc/fail2ban/jail.local." \
+                 "Fail2Ban does NOT watch the current SSH port. Check the [sshd] section in /etc/fail2ban/jail.local.")"
+    return 1
 }
 
 # ============================================================
@@ -880,6 +859,14 @@ fi
 
 # ---------------- Other steps ----------------
 
+ask_yn "$(L "Усилить защиту SSH и настроить UFW (security.sh: вход только по ключу, файрвол)?" \
+            "Harden SSH and configure UFW (security.sh: key-only login, firewall)?")" "y" \
+    && DO_SECURITY=1 || DO_SECURITY=0
+
+ask_yn "$(L "Установить Fail2Ban (блокировка перебора паролей)?" \
+            "Install Fail2Ban (blocks brute-force attempts)?")" "y" \
+    && DO_F2B=1 || DO_F2B=0
+
 ask_yn "$(L "Установить приветственный дашборд (информация о сервере при входе)?" \
             "Install login dashboard (server info shown on login)?")" "y" \
     && DO_DASHBOARD=1 || DO_DASHBOARD=0
@@ -894,52 +881,22 @@ fi
 ask_yn "$(L "Настроить swap-файл (${SWAP_NOTE})?" "Configure swap file (${SWAP_NOTE})?")" "$DEF_SWAP" \
     && DO_SWAP=1 || DO_SWAP=0
 
-ask_yn "$(L "Установить Fail2Ban (блокировка перебора паролей)?" \
-            "Install Fail2Ban (blocks brute-force attempts)?")" "y" \
-    && DO_F2B=1 || DO_F2B=0
-
-ask_yn "$(L "Усилить защиту SSH (security.sh: отключает вход по паролю, работает только по ключу)?" \
-            "Harden SSH (security.sh: disables password login, key-only access)?")" "y" \
-    && DO_SECURITY=1 || DO_SECURITY=0
-
 ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")" "y" \
     && DO_REMNANODE=1 || DO_REMNANODE=0
-
-# ---------------- UFW ----------------
-
-if ask_yn "$(L "Включить файрвол UFW (закрыть все порты, кроме нужных)?" \
-               "Enable UFW firewall (close all ports except required ones)?")" "y"; then
-    DO_UFW=1
-    NODE_PORT="$(ask_input "$(L "Порт ноды для связи с панелью (NODE_PORT)" \
-                                "Node port for panel connection (NODE_PORT)")" "${NODE_PORT:-2222}")"
-    PANEL_IP="$(ask_input "$(L "IP панели: порт ноды будет открыт только для него (Enter — открыть для всех)" \
-                               "Panel IP: node port will be open only to it (Enter — open to everyone)")" "${PANEL_IP:-}")"
-    UFW_EXTRA_PORTS="$(ask_input "$(L "Дополнительные открытые порты через запятую" \
-                                      "Extra open ports, comma-separated")" "${UFW_EXTRA_PORTS:-443}")"
-else
-    DO_UFW=0
-fi
 
 # ---------------- Confirm ----------------
 
 yn_word() { [[ "$1" -eq 1 ]] && L "да" "yes" || L "нет" "no"; }
 
 section "$(L "ПЛАН УСТАНОВКИ" "INSTALLATION PLAN")"
-echo "  $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
-echo "  $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")"
-echo "  XanMod + BBRv3            : $(yn_word "$DO_XANMOD")"
-echo "  bbrv3.sh (opiran)         : $(yn_word "$DO_BBR_SCRIPT")"
-echo "  $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
-echo "  Swap                      : $(yn_word "$DO_SWAP")"
-echo "  Fail2Ban                  : $(yn_word "$DO_F2B")"
-echo "  $(L "Защита SSH (security.sh) " "SSH hardening            "): $(yn_word "$DO_SECURITY")"
-echo "  Remnanode                 : $(yn_word "$DO_REMNANODE")"
-echo "  UFW                       : $(yn_word "$DO_UFW")"
-if [[ "$DO_UFW" -eq 1 ]]; then
-    echo "      NODE_PORT : ${NODE_PORT}"
-    echo "      PANEL_IP  : ${PANEL_IP:-$(L "любой" "any")}"
-    echo "      $(L "доп. порты" "extra    ") : ${UFW_EXTRA_PORTS}"
-fi
+echo "  01 $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
+echo "  02 XanMod + BBRv3            : $(yn_word "$DO_XANMOD")$([[ "$DO_BBR_SCRIPT" -eq 1 ]] && echo "  (bbrv3.sh opiran)")"
+echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")"
+echo "  04 $(L "Защита SSH + UFW (security.sh)" "SSH hardening + UFW (security.sh)"): $(yn_word "$DO_SECURITY")"
+echo "  05 Fail2Ban                  : $(yn_word "$DO_F2B")"
+echo "  06 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
+echo "  07 Swap                      : $(yn_word "$DO_SWAP")"
+echo "  08 Remnanode                 : $(yn_word "$DO_REMNANODE")"
 echo
 
 if ! ask_yn "$(L "Начать установку?" "Start installation?")" "y"; then
@@ -999,32 +956,45 @@ if [[ "$DO_BBR_SCRIPT" -eq 1 ]]; then
 fi
 
 # ============================================================
-# 03..07 - DIGNEZZZ SCRIPTS
+# 03 - SSH PORT -> 04 - SECURITY (UFW) -> 05 - FAIL2BAN
+# Сначала ваш SSH-порт, затем security.sh настраивает UFW,
+# затем Fail2Ban ставится на рабочий порт и проверяется.
 # ============================================================
 
 if [[ "$DO_SSH_PORT" -eq 1 ]]; then
     run_remote "03-ssh-port" "${DIGNEZZZ_BASE}/ssh-port.sh"
-    ensure_ufw >/dev/null 2>&1 || true
+    info "$(L "SSH-порт(ы) после смены" "SSH port(s) after change"): $(get_ssh_ports)"
 else
     skip_step "03-ssh-port"
 fi
-
-run_optional "$DO_DASHBOARD" "04-dashboard" "${DIGNEZZZ_BASE}/dashboard.sh"
-run_optional "$DO_SWAP"      "05-swap"      "${DIGNEZZZ_BASE}/swap.sh"
-run_optional "$DO_F2B"       "06-f2b"       "${DIGNEZZZ_BASE}/f2b.sh"
 
 if [[ "$DO_SECURITY" -eq 1 ]]; then
     if [[ -z "$(find_ssh_key_files)" ]]; then
         error "$(L "На сервере нет ни одного SSH-ключа — security.sh пропущен, иначе вы потеряете доступ." \
                    "No SSH keys on this server — security.sh skipped, otherwise you would lose access.")"
-        FAILED_STEPS+=("07-security (no ssh key)")
+        FAILED_STEPS+=("04-security (no ssh key)")
         INSTALL_FAILED=1
     else
-        run_remote "07-security" "${DIGNEZZZ_BASE}/security.sh"
+        run_remote "04-security" "${DIGNEZZZ_BASE}/security.sh"
     fi
 else
-    skip_step "07-security"
+    skip_step "04-security"
 fi
+
+if [[ "$DO_F2B" -eq 1 ]]; then
+    run_remote "05-f2b" "${DIGNEZZZ_BASE}/f2b.sh"
+    section "05b-f2b-check"
+    check_f2b_ssh_port || INSTALL_FAILED=1
+else
+    skip_step "05-f2b"
+fi
+
+# ============================================================
+# 06 - DASHBOARD, 07 - SWAP
+# ============================================================
+
+run_optional "$DO_DASHBOARD" "06-dashboard" "${DIGNEZZZ_BASE}/dashboard.sh"
+run_optional "$DO_SWAP"      "07-swap"      "${DIGNEZZZ_BASE}/swap.sh"
 
 # ============================================================
 # 08 - REMNANODE
@@ -1034,16 +1004,6 @@ if [[ "$DO_REMNANODE" -eq 1 ]]; then
     install_remnanode
 else
     skip_step "08-remnanode"
-fi
-
-# ============================================================
-# 09 - UFW
-# ============================================================
-
-if [[ "$DO_UFW" -eq 1 ]]; then
-    run_local "09-ufw" configure_ufw
-else
-    skip_step "09-ufw"
 fi
 
 # ============================================================
