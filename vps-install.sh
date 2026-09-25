@@ -4,21 +4,22 @@
 # Ubuntu / Debian
 # https://github.com/awosart/vps-installer
 #
-# Запуск:
+# Run:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/awosart/vps-installer/main/vps-install.sh)
 #
-# Флаги:
-#   -y, --yes   принять ответы по умолчанию (без вопросов)
-#   -h, --help  справка
+# Flags:
+#   --lang ru|en   interface language
+#   -y, --yes      accept defaults, no questions
+#   -h, --help     help
 #
-# Переменные окружения (для автоматического режима):
-#   SSH_PUBLIC_KEY="ssh-ed25519 AAAA..."   ключ для root
-#   PANEL_IP="1.2.3.4"                     открыть порт ноды только для панели
-#   NODE_PORT="2222"                       порт ноды (если .env ещё нет)
-#   UFW_EXTRA_PORTS="443,8443/tcp"         дополнительные порты
+# Env (for unattended mode):
+#   SSH_PUBLIC_KEY="ssh-ed25519 AAAA..."
+#   PANEL_IP="1.2.3.4"
+#   NODE_PORT="2222"
+#   UFW_EXTRA_PORTS="443,8443/tcp"
 # ============================================================
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.4.0"
 
 set -o pipefail
 
@@ -45,6 +46,34 @@ BBR_SYSCTL="/etc/sysctl.d/99-bbr.conf"
 SSH_KEY_RE='(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+AAAA'
 
 ASSUME_YES=0
+UI_LANG=""
+
+# ============================================================
+# ARGUMENTS
+# ============================================================
+
+usage() {
+    cat <<'EOF_USAGE'
+Usage: vps-install.sh [--lang ru|en] [-y|--yes] [-h|--help]
+
+  --lang ru|en   interface language / язык интерфейса
+  -y, --yes      accept defaults / ответы по умолчанию
+
+Env: SSH_PUBLIC_KEY, PANEL_IP, NODE_PORT, UFW_EXTRA_PORTS
+EOF_USAGE
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)  ASSUME_YES=1 ;;
+        --lang)    UI_LANG="${2:-}"; shift ;;
+        --lang=*)  UI_LANG="${1#--lang=}" ;;
+        -h|--help) usage ;;
+        *) echo "Unknown argument: $1"; exit 1 ;;
+    esac
+    shift
+done
 
 # ============================================================
 # COLORS / OUTPUT
@@ -55,7 +84,13 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
+
+# L "русский" "english" -> строка на выбранном языке
+L() {
+    if [[ "$UI_LANG" == "ru" ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi
+}
 
 log()     { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 info()    { echo -e "${BLUE}[INFO]${NC} $*"; }
@@ -71,36 +106,17 @@ section() {
     echo
 }
 
-usage() {
-    cat <<'EOF_USAGE'
-Usage: vps-install.sh [-y|--yes] [-h|--help]
-
-  -y, --yes   принять ответы по умолчанию (без вопросов)
-
-Env: SSH_PUBLIC_KEY, PANEL_IP, NODE_PORT, UFW_EXTRA_PORTS
-EOF_USAGE
-    exit 0
-}
-
-for arg in "$@"; do
-    case "$arg" in
-        -y|--yes)  ASSUME_YES=1 ;;
-        -h|--help) usage ;;
-        *) echo "Unknown argument: $arg"; exit 1 ;;
-    esac
-done
-
 # ============================================================
 # ROOT / OS CHECK
 # ============================================================
 
 if [[ "${EUID}" -ne 0 ]]; then
-    error "This installer must be run as root."
+    echo "ERROR: run as root (sudo -i) / запустите от root (sudo -i)"
     exit 1
 fi
 
 if [[ ! -f /etc/os-release ]]; then
-    error "Cannot determine operating system."
+    echo "ERROR: cannot detect OS / не удалось определить ОС"
     exit 1
 fi
 
@@ -108,30 +124,58 @@ fi
 source /etc/os-release
 
 if [[ "${ID}" != "ubuntu" && "${ID}" != "debian" ]]; then
-    error "Supported: Ubuntu / Debian. Detected: ${PRETTY_NAME:-unknown}"
+    echo "ERROR: Ubuntu/Debian only. Detected: ${PRETTY_NAME:-unknown}"
     exit 1
 fi
 
 # ============================================================
-# LOGGING
+# TERMINAL / LOGGING
 # ============================================================
 
 mkdir -p "$LOG_DIR" "$BACKUP_DIR"
 TMP_DIR="$(mktemp -d /tmp/vps-installer.XXXXXX)"
 
-# fd 3/4 = настоящий терминал. Интерактивные скрипты (ssh-port, remnanode)
-# запускаются с ними, иначе они видят pipe вместо TTY и падают
-# (clear / меню / read при set -e).
-exec 3>&1 4>&2
-exec > >(tee -a "$MASTER_LOG") 2>&1
-
-# Ввод всегда читаем с терминала: так скрипт работает и при `curl | bash`.
+# Ввод всегда с терминала: работает и при `curl | bash`.
 if (: </dev/tty) 2>/dev/null; then
     TTY_IN="/dev/tty"
 else
     TTY_IN="/dev/null"
     ASSUME_YES=1
 fi
+
+# ------------------------------------------------------------
+# LANGUAGE (до включения лога, чтобы меню было чистым)
+# ------------------------------------------------------------
+
+case "$UI_LANG" in
+    ru|RU|rus|russian) UI_LANG="ru" ;;
+    en|EN|eng|english) UI_LANG="en" ;;
+    *)
+        UI_LANG=""
+        if [[ "$ASSUME_YES" -eq 1 ]]; then
+            [[ "${LANG:-}" == ru* ]] && UI_LANG="ru" || UI_LANG="en"
+        else
+            echo
+            echo "  Select language / Выберите язык:"
+            echo
+            echo "    1) English"
+            echo "    2) Русский"
+            echo
+            while [[ -z "$UI_LANG" ]]; do
+                read -r -p "  [1/2]: " lang_answer <"$TTY_IN"
+                case "$lang_answer" in
+                    1|en|EN) UI_LANG="en" ;;
+                    2|ru|RU) UI_LANG="ru" ;;
+                    *) echo "  Enter 1 or 2 / Введите 1 или 2" ;;
+                esac
+            done
+        fi
+        ;;
+esac
+
+# fd 3/4 = настоящий терминал для интерактивных внешних скриптов.
+exec 3>&1 4>&2
+exec > >(tee -a "$MASTER_LOG") 2>&1
 
 cleanup() {
     rm -rf "$TMP_DIR" 2>/dev/null || true
@@ -148,29 +192,67 @@ INSTALL_FAILED=0
 # PROMPTS
 # ============================================================
 
+# Сбрасывает лишние строки, оставшиеся в буфере терминала после
+# многострочной вставки, чтобы они не стали ответами на следующие вопросы.
+flush_tty_input() {
+
+    while IFS= read -r -t 0.3 _ <"$TTY_IN"; do :; done 2>/dev/null
+}
+
 ask_yn() {
     local prompt="$1" default="${2:-n}" answer hint
-
-    [[ "$default" == "y" ]] && hint="Y/n" || hint="y/N"
+    hint="$(L "да/нет" "yes/no")"
+    local def_word
+    [[ "$default" == "y" ]] && def_word="$(L "да" "yes")" || def_word="$(L "нет" "no")"
 
     if [[ "$ASSUME_YES" -eq 1 ]]; then
-        echo "  ${prompt} [${hint}]: ${default} (auto)"
+        echo "  ${prompt} -> ${def_word} (auto)"
         [[ "$default" == "y" ]]
         return
     fi
 
     while true; do
-        read -r -p "$(echo -e "${CYAN}?${NC}") ${prompt} [${hint}]: " answer <"$TTY_IN"
+        read -r -p "$(echo -e "${CYAN}?${NC}") ${prompt} [${hint}, Enter = ${def_word}]: " answer <"$TTY_IN"
         answer="${answer:-$default}"
         case "${answer,,}" in
             y|yes|д|да)  return 0 ;;
             n|no|н|нет)  return 1 ;;
-            *) warning "Ответьте y или n." ;;
+            *) warning "$(L "Введите y (да) или n (нет)." "Enter y (yes) or n (no).")" ;;
         esac
     done
 }
 
-# Результат печатается в stdout, подсказка — в stderr (read -p).
+# ask_choice "Вопрос" default "вариант 1" "вариант 2" ... -> печатает номер
+ask_choice() {
+    local prompt="$1" default="$2"
+    shift 2
+    local options=("$@") i answer
+
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        echo "  ${prompt} -> ${default}) ${options[$((default - 1))]} (auto)" >&2
+        echo "$default"
+        return
+    fi
+
+    {
+        echo
+        echo -e "${CYAN}?${NC} ${BOLD}${prompt}${NC}"
+        for i in "${!options[@]}"; do
+            echo "    $((i + 1))) ${options[$i]}"
+        done
+    } >&2
+
+    while true; do
+        read -r -p "  $(L "Номер" "Number") [1-${#options[@]}, Enter = ${default}]: " answer <"$TTY_IN"
+        answer="${answer:-$default}"
+        if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#options[@]} )); then
+            echo "$answer"
+            return
+        fi
+        warning "$(L "Введите номер от 1 до ${#options[@]}." "Enter a number from 1 to ${#options[@]}.")" >&2
+    done
+}
+
 ask_input() {
     local prompt="$1" default="${2:-}" answer
 
@@ -179,7 +261,7 @@ ask_input() {
         return
     fi
 
-    read -r -p "$(echo -e "${CYAN}?${NC}") ${prompt}${default:+ [${default}]}: " answer <"$TTY_IN"
+    read -r -p "$(echo -e "${CYAN}?${NC}") ${prompt}${default:+ [Enter = ${default}]}: " answer <"$TTY_IN"
     echo "${answer:-$default}"
 }
 
@@ -190,9 +272,6 @@ ask_input() {
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-# Lock::Timeout вместо ручного pgrep (pgrep -x unattended-upgrade никогда не
-# совпадал: имя процесса обрезается до 15 символов).
-# force-confold — не зависать на вопросе про изменённый sshd_config.
 APT_OPTS=(
     -y -q
     -o DPkg::Lock::Timeout=600
@@ -206,9 +285,11 @@ apt_get() {
 
 wait_for_cloud_init() {
     if command -v cloud-init >/dev/null 2>&1 && [[ -d /run/cloud-init ]]; then
-        info "Ожидание завершения cloud-init (свежий инстанс может ещё ставить пакеты)..."
+        info "$(L "Жду завершения cloud-init (на новом сервере он может ещё ставить пакеты)..." \
+                 "Waiting for cloud-init (a fresh server may still be installing packages)...")"
         timeout 600 cloud-init status --wait >/dev/null 2>&1 \
-            || warning "cloud-init не завершился за 10 минут, продолжаем."
+            || warning "$(L "cloud-init не завершился за 10 минут, продолжаю." \
+                            "cloud-init did not finish within 10 minutes, continuing.")"
     fi
 }
 
@@ -229,9 +310,6 @@ detect_cloud() {
     fi
 }
 
-# Ищет authorized_keys с реальными ключами у root и у всех пользователей.
-# Учитывает строки с опциями в начале (как у root на AWS:
-# no-port-forwarding,...,command="..." ssh-rsa AAAA...).
 find_ssh_key_files() {
     local f
     for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
@@ -240,6 +318,10 @@ find_ssh_key_files() {
             echo "$f"
         fi
     done
+}
+
+count_keys_in() {
+    grep -Ec "(^|[[:space:]])${SSH_KEY_RE}" "$1" 2>/dev/null || echo 0
 }
 
 root_keys_blocked() {
@@ -273,21 +355,20 @@ get_node_port() {
 mark_result() {
     local name="$1" rc="$2"
     if [[ "$rc" -eq 0 ]]; then
-        success "${name}: completed."
+        success "${name}: $(L "готово." "done.")"
         COMPLETED_STEPS+=("$name")
     else
-        error "${name}: failed (exit code ${rc})."
+        error "${name}: $(L "ошибка (код ${rc})." "failed (exit code ${rc}).")"
         FAILED_STEPS+=("$name")
         INSTALL_FAILED=1
     fi
 }
 
 skip_step() {
-    info "$1: пропущено."
+    info "$1: $(L "пропущено." "skipped.")"
     SKIPPED_STEPS+=("$1")
 }
 
-# Локальная функция скрипта.
 run_local() {
     local name="$1"
     shift
@@ -296,8 +377,6 @@ run_local() {
     mark_result "$name" $?
 }
 
-# Внешний скрипт: скачать -> проверить синтаксис -> запустить с настоящим TTY.
-# Лог пишется через `script`, который даёт дочернему процессу псевдотерминал.
 run_remote() {
     local name="$1" url="$2"
     shift 2
@@ -311,12 +390,13 @@ run_remote() {
 
     if ! curl -fLsS --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
             "$url" -o "$tmp_script" || [[ ! -s "$tmp_script" ]]; then
+        error "$(L "Не удалось скачать скрипт." "Failed to download script.")"
         mark_result "$name" 1
         return 1
     fi
 
     if ! bash -n "$tmp_script" 2>"$step_log"; then
-        error "${name}: invalid Bash syntax."
+        error "$(L "Скачанный скрипт содержит синтаксическую ошибку." "Downloaded script has a syntax error.")"
         cat "$step_log"
         mark_result "$name" 1
         return 1
@@ -338,58 +418,179 @@ run_remote() {
     return "$rc"
 }
 
+run_optional() {
+    local flag="$1" name="$2" url="$3"
+    if [[ "$flag" -eq 1 ]]; then
+        run_remote "$name" "$url"
+    else
+        skip_step "$name"
+    fi
+}
+
 # ============================================================
-# STEP: SSH KEY
+# STEP: SSH
 # ============================================================
 
 ensure_ssh_server() {
     if ! command -v sshd >/dev/null 2>&1 && [[ ! -x /usr/sbin/sshd ]]; then
-        warning "OpenSSH server не установлен. Устанавливаю..."
+        warning "$(L "OpenSSH-сервер не установлен, устанавливаю..." "OpenSSH server is not installed, installing...")"
         apt_get install openssh-server || return 1
         systemctl enable --now ssh 2>/dev/null || true
     fi
     return 0
 }
 
+show_existing_keys() {
+    local f n
+    for f in "$@"; do
+        n="$(count_keys_in "$f")"
+        echo -e "  ${GREEN}${f}${NC} — $(L "ключей" "keys"): ${n}"
+        ssh-keygen -l -f "$f" 2>/dev/null | sed 's/^/      /'
+    done
+}
+
+# Читает многострочный блок до строки END (или паузы во вводе).
+read_pasted_block() {
+    local line block="$1"
+    while IFS= read -r -t 3 line <"$TTY_IN"; do
+        line="${line%$'\r'}"
+        block+=$'\n'"$line"
+        [[ "$line" == *"END "*"KEY"* || "$line" == *"END SSH2 PUBLIC KEY"* ]] && break
+    done
+    printf '%s\n' "$block"
+}
+
+# Приводит вставленный текст к одной строке публичного ключа OpenSSH.
+# Печатает ключ в stdout, при ошибке возвращает 1 (пояснение в stderr).
+normalize_pubkey() {
+    local input="$1" tmp out
+
+    # 1. Обычный публичный ключ OpenSSH
+    if [[ "$input" =~ ^${SSH_KEY_RE} ]]; then
+        printf '%s\n' "$input" | head -n1
+        return 0
+    fi
+
+    tmp="$(mktemp -p /dev/shm 2>/dev/null || mktemp)"
+    chmod 600 "$tmp"
+    printf '%s\n' "$input" > "$tmp"
+
+    # 2. Публичный ключ в формате SSH2/RFC4716 (PuTTYgen "Save public key")
+    if [[ "$input" == *"BEGIN SSH2 PUBLIC KEY"* ]]; then
+        out="$(ssh-keygen -i -m RFC4716 -f "$tmp" 2>/dev/null)"
+        rm -f "$tmp"
+        if [[ -n "$out" ]]; then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        error "$(L "Не удалось прочитать ключ формата SSH2." "Could not parse the SSH2-format key.")" >&2
+        return 1
+    fi
+
+    # 3. Вставлен ПРИВАТНЫЙ ключ — извлекаем из него публичную часть,
+    #    сам приватный ключ нигде не сохраняется.
+    if [[ "$input" == *"PRIVATE KEY"* ]]; then
+        warning "$(L "Вы вставили ПРИВАТНЫЙ ключ. Его не нужно передавать на сервер." \
+                     "You pasted a PRIVATE key. It should never be sent to a server.")" >&2
+        out="$(ssh-keygen -y -P "" -f "$tmp" 2>/dev/null)"
+        if command -v shred >/dev/null 2>&1; then shred -u "$tmp" 2>/dev/null; else rm -f "$tmp"; fi
+        if [[ -n "$out" ]]; then
+            warning "$(L "Из него извлечена публичная часть, приватный ключ удалён из памяти." \
+                         "Its public part was extracted, the private key was discarded.")" >&2
+            printf '%s vps-installer\n' "$out"
+            return 0
+        fi
+        error "$(L "Ключ защищён паролем или повреждён. На своём компьютере выполните: ssh-keygen -y -f <файл_ключа>  и вставьте результат." \
+                   "Key is passphrase-protected or damaged. On your computer run: ssh-keygen -y -f <key_file>  and paste the output.")" >&2
+        return 1
+    fi
+
+    rm -f "$tmp"
+
+    if [[ "$input" == PuTTY-User-Key-File* ]]; then
+        error "$(L "Это файл .ppk (PuTTY). В PuTTYgen скопируйте поле 'Public key for pasting into OpenSSH authorized_keys file'." \
+                   "This is a .ppk (PuTTY) file. In PuTTYgen copy the field 'Public key for pasting into OpenSSH authorized_keys file'.")" >&2
+        return 1
+    fi
+
+    error "$(L "Не похоже на SSH-ключ. Нужна одна строка, которая начинается с ssh-ed25519 или ssh-rsa." \
+               "This does not look like an SSH key. Expected one line starting with ssh-ed25519 or ssh-rsa.")" >&2
+    return 1
+}
+
 add_root_ssh_key() {
-    local auth="/root/.ssh/authorized_keys" key
+    local auth="/root/.ssh/authorized_keys" raw key
 
     install -d -m 700 /root/.ssh
     touch "$auth"
     chmod 600 "$auth"
 
-    if [[ -n "${SSH_PUBLIC_KEY:-}" ]]; then
-        key="$SSH_PUBLIC_KEY"
-    elif [[ "$ASSUME_YES" -eq 1 ]]; then
-        error "Нет SSH-ключа и нет терминала/SSH_PUBLIC_KEY для ввода."
-        return 1
-    fi
-
     while true; do
-        if [[ -z "${key:-}" ]]; then
-            echo
-            echo "Вставьте публичный ключ, пример: ssh-ed25519 AAAA... user@pc"
-            read -r -p "SSH public key: " key <"$TTY_IN"
-        fi
-
-        key="$(printf '%s' "$key" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-
-        if [[ -z "$key" ]]; then
-            warning "Ключ не может быть пустым."
-        elif ! [[ "$key" =~ ^${SSH_KEY_RE} ]]; then
-            warning "Это не похоже на публичный SSH-ключ (нужна полная строка)."
-        elif command -v ssh-keygen >/dev/null 2>&1 \
-                && ! ssh-keygen -l -f <(printf '%s\n' "$key") >/dev/null 2>&1; then
-            warning "ssh-keygen не принимает этот ключ (обрезан/повреждён?)."
+        if [[ -n "${SSH_PUBLIC_KEY:-}" ]]; then
+            raw="$SSH_PUBLIC_KEY"
+            SSH_PUBLIC_KEY=""
+        elif [[ "$ASSUME_YES" -eq 1 ]]; then
+            error "$(L "Нет терминала для ввода ключа. Передайте его через SSH_PUBLIC_KEY." \
+                       "No terminal to enter the key. Pass it via SSH_PUBLIC_KEY.")"
+            return 1
         else
-            grep -Fqx -- "$key" "$auth" || printf '%s\n' "$key" >> "$auth"
-            success "Ключ добавлен в ${auth}:"
-            ssh-keygen -l -f <(printf '%s\n' "$key") 2>/dev/null || true
-            return 0
+            echo
+            echo -e "${BOLD}$(L "Вставьте ваш ПУБЛИЧНЫЙ SSH-ключ и нажмите Enter." \
+                                 "Paste your PUBLIC SSH key and press Enter.")${NC}"
+            echo
+            L "  Это одна строка из файла .pub на вашем компьютере, например:" \
+              "  It is one line from the .pub file on your computer, for example:"; echo
+            echo "      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... user@laptop"
+            echo
+            L "  Как получить (на вашем компьютере, НЕ на сервере):" \
+              "  How to get it (on your computer, NOT on the server):"; echo
+            echo "      Linux/macOS:  cat ~/.ssh/id_ed25519.pub"
+            echo "      Windows:      type %USERPROFILE%\\.ssh\\id_ed25519.pub"
+            L "      Нет ключа?    ssh-keygen -t ed25519" \
+              "      No key yet?   ssh-keygen -t ed25519"; echo
+            echo
+            L "  Файл без .pub (-----BEGIN ... PRIVATE KEY-----) — это приватный ключ, его не вставляйте." \
+              "  A file without .pub (-----BEGIN ... PRIVATE KEY-----) is the private key, do not paste it."; echo
+            echo
+
+            read -r -p "$(L "Публичный ключ" "Public key"): " raw <"$TTY_IN"
+            raw="${raw%$'\r'}"
+
+            # Многострочный блок: дочитываем его целиком, чтобы строки
+            # не ушли ответами на следующие вопросы.
+            if [[ "$raw" == -----BEGIN* || "$raw" == "---- BEGIN"* ]]; then
+                raw="$(read_pasted_block "$raw")"
+            fi
+            flush_tty_input
         fi
 
-        [[ "$ASSUME_YES" -eq 1 ]] && return 1
-        key=""
+        raw="$(printf '%s' "$raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+        if [[ -z "$raw" ]]; then
+            warning "$(L "Пустой ввод. Вставьте ключ." "Empty input. Please paste the key.")"
+            continue
+        fi
+
+        if ! key="$(normalize_pubkey "$raw")"; then
+            unset raw
+            continue
+        fi
+        unset raw
+
+        if ! ssh-keygen -l -f <(printf '%s\n' "$key") >/dev/null 2>&1; then
+            error "$(L "Ключ повреждён (возможно, обрезан при копировании)." \
+                       "The key is damaged (possibly cut off while copying).")"
+            continue
+        fi
+
+        if grep -Fq -- "$(awk '{print $2}' <<<"$key")" "$auth"; then
+            success "$(L "Этот ключ уже есть в ${auth}." "This key is already in ${auth}.")"
+        else
+            printf '%s\n' "$key" >> "$auth"
+            success "$(L "Ключ добавлен в ${auth}:" "Key added to ${auth}:")"
+        fi
+        ssh-keygen -l -f <(printf '%s\n' "$key") 2>/dev/null | sed 's/^/  /'
+        return 0
     done
 }
 
@@ -398,7 +599,7 @@ backup_ssh_config() {
     stamp="$(date '+%Y%m%d-%H%M%S')"
     if [[ -d /etc/ssh ]]; then
         tar -czf "${BACKUP_DIR}/etc-ssh.${stamp}.tar.gz" -C /etc ssh 2>/dev/null \
-            && success "Бэкап /etc/ssh: ${BACKUP_DIR}/etc-ssh.${stamp}.tar.gz"
+            && success "$(L "Резервная копия /etc/ssh" "Backup of /etc/ssh"): ${BACKUP_DIR}/etc-ssh.${stamp}.tar.gz"
     fi
 }
 
@@ -412,9 +613,8 @@ xanmod_clean_old_repos() {
 
     while IFS= read -r -d '' f; do
         grep -q 'deb\.xanmod\.org' "$f" 2>/dev/null || continue
-        info "Удаляю старый XanMod-репозиторий: $f"
+        info "$(L "Удаляю старый репозиторий XanMod" "Removing old XanMod repository"): $f"
         if [[ "$f" == *.sources ]]; then
-            # deb822: построчное удаление ломает блок, удаляем файл целиком
             rm -f "$f"
         else
             sed -i '/deb\.xanmod\.org/d' "$f"
@@ -430,7 +630,7 @@ xanmod_clean_old_repos() {
 xanmod_detect_package() {
     local out level=0
 
-    # check_x86-64_psabi.sh — это awk-скрипт, а не bash.
+    # check_x86-64_psabi.sh — awk-скрипт, не bash.
     out="$(curl -fsSL --retry 3 "$XANMOD_CPU_CHECK_URL" 2>/dev/null | awk -f - 2>&1 || true)"
 
     if [[ -n "$out" ]]; then
@@ -442,7 +642,6 @@ xanmod_detect_package() {
         fi
     fi
 
-    # Фоллбэк по флагам CPU, если проверка не скачалась.
     if [[ "$level" -eq 0 ]]; then
         local flags
         flags="$(grep -m1 '^flags' /proc/cpuinfo)"
@@ -457,7 +656,7 @@ xanmod_detect_package() {
     fi
 
     case "$level" in
-        3|4) echo "linux-xanmod-x64v3" ;;   # отдельного x64v4 у XanMod нет
+        3|4) echo "linux-xanmod-x64v3" ;;
         2)   echo "linux-xanmod-x64v2" ;;
         *)   echo "linux-xanmod-lts-x64v1" ;;
     esac
@@ -467,39 +666,40 @@ install_xanmod() {
     local codename="${VERSION_CODENAME:-}" pkg
 
     if [[ "$(uname -m)" != "x86_64" ]]; then
-        warning "XanMod собирается только под x86_64 (тут $(uname -m)). Пропуск."
+        warning "$(L "XanMod есть только для x86_64 (здесь $(uname -m)). Пропуск." \
+                     "XanMod is x86_64 only (this is $(uname -m)). Skipping.")"
         return 0
     fi
 
     if [[ -z "$codename" ]]; then
-        error "Не удалось определить codename дистрибутива."
+        error "$(L "Не удалось определить codename дистрибутива." "Could not detect distribution codename.")"
         return 1
     fi
 
     xanmod_clean_old_repos
-
     apt_get install ca-certificates curl gnupg || return 1
 
     pkg="$(xanmod_detect_package)"
-    info "Выбран пакет: ${pkg}"
+    info "$(L "Выбран пакет" "Selected package"): ${pkg}"
 
     install -d -m 0755 /etc/apt/keyrings
     if ! curl -fsSL --retry 3 "$XANMOD_KEY_URL" | gpg --dearmor --yes -o "$XANMOD_KEYRING"; then
-        error "Не удалось скачать ключ XanMod."
+        error "$(L "Не удалось скачать ключ репозитория XanMod." "Failed to download XanMod repository key.")"
         return 1
     fi
     chmod 0644 "$XANMOD_KEYRING"
 
     echo "deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO} ${codename} main" > "$XANMOD_LIST"
-    info "Репозиторий: $(cat "$XANMOD_LIST")"
+    info "Repository: $(cat "$XANMOD_LIST")"
 
     if ! apt_get update; then
-        error "apt-get update с репозиторием XanMod не прошёл."
+        error "apt-get update (XanMod) failed."
         return 1
     fi
 
     if ! apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-        error "Пакет ${pkg} недоступен для ${codename}. Убираю репозиторий."
+        error "$(L "Пакет ${pkg} недоступен для ${codename}. Репозиторий удалён." \
+                   "Package ${pkg} is not available for ${codename}. Repository removed.")"
         rm -f "$XANMOD_LIST"
         apt_get update >/dev/null 2>&1 || true
         return 1
@@ -508,10 +708,9 @@ install_xanmod() {
     apt_get install "$pkg" || return 1
 
     if command -v update-grub >/dev/null 2>&1; then
-        update-grub || warning "update-grub завершился с ошибкой."
+        update-grub || warning "update-grub failed."
     fi
 
-    # В ядре XanMod "bbr" = BBRv3. Включится после перезагрузки в новое ядро.
     cat > "$BBR_SYSCTL" <<EOF
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -519,7 +718,7 @@ EOF
     sysctl --system >/dev/null 2>&1 || true
 
     REBOOT_REQUIRED="YES"
-    success "XanMod установлен: $(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { print $2 }' | tail -n1)"
+    success "XanMod: $(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { print $2 }' | tail -n1)"
     return 0
 }
 
@@ -531,14 +730,12 @@ ensure_ufw() {
     local p
 
     if ! command -v ufw >/dev/null 2>&1; then
-        warning "UFW не установлен. Устанавливаю..."
+        warning "$(L "UFW не установлен, устанавливаю..." "UFW is not installed, installing...")"
         apt_get install ufw || return 1
     else
-        success "UFW уже установлен."
+        success "$(L "UFW уже установлен." "UFW is already installed.")"
     fi
 
-    # Разрешаем текущий SSH-порт заранее: если какой-то внешний скрипт
-    # включит UFW, доступ не потеряется.
     for p in $(get_ssh_ports); do
         ufw allow "${p}/tcp" comment 'SSH' >/dev/null
     done
@@ -551,27 +748,27 @@ configure_ufw() {
     ensure_ufw || return 1
 
     for p in $(get_ssh_ports); do
-        info "SSH порт ${p}/tcp -> allow"
+        info "$(L "SSH-порт" "SSH port") ${p}/tcp -> allow"
         ufw allow "${p}/tcp" comment 'SSH'
     done
 
     node_port="$(get_node_port)"
     if [[ -n "$node_port" ]]; then
         if [[ -n "$PANEL_IP" ]]; then
-            info "Порт ноды ${node_port}/tcp -> только с ${PANEL_IP}"
+            info "$(L "Порт ноды" "Node port") ${node_port}/tcp -> $(L "только с" "only from") ${PANEL_IP}"
             ufw allow from "$PANEL_IP" to any port "$node_port" proto tcp comment 'Remnawave panel'
         else
-            info "Порт ноды ${node_port}/tcp -> allow (для всех)"
+            info "$(L "Порт ноды" "Node port") ${node_port}/tcp -> $(L "открыт для всех" "open to everyone")"
             ufw allow "${node_port}/tcp" comment 'Remnanode'
         fi
     fi
 
     for p in ${UFW_EXTRA_PORTS//,/ }; do
         if [[ "$p" =~ ^[0-9]{1,5}(:[0-9]{1,5})?(/(tcp|udp))?$ ]]; then
-            info "Доп. порт ${p} -> allow"
+            info "$(L "Доп. порт" "Extra port") ${p} -> allow"
             ufw allow "$p" comment 'extra'
         else
-            warning "Некорректный порт '${p}', пропуск."
+            warning "$(L "Некорректный порт" "Invalid port") '${p}', $(L "пропуск" "skipped")."
         fi
     done
 
@@ -583,14 +780,12 @@ configure_ufw() {
 }
 
 # ============================================================
-# STEP: REMNANODE (ровно тот вызов, что работает вручную)
+# STEP: REMNANODE
 # ============================================================
 
 install_remnanode() {
     section "08-remnanode"
     log "bash <(curl -fsSL ${REMNANODE_URL}) @ install"
-
-    # Прямо в терминал, без tee/pipe — скрипт интерактивный и использует clear/меню.
     bash <(curl -fsSL "$REMNANODE_URL") @ install <"$TTY_IN" >&3 2>&4
     mark_result "08-remnanode" $?
 }
@@ -602,80 +797,154 @@ install_remnanode() {
 section "VPS INSTALLER v${SCRIPT_VERSION}"
 
 CLOUD="$(detect_cloud)"
+CURRENT_SSH_PORTS="$(get_ssh_ports)"
 
 log "OS:           ${PRETTY_NAME}"
 log "Kernel:       $(uname -r)"
 log "Architecture: $(uname -m)"
 log "Hostname:     $(hostname)"
 log "Cloud:        ${CLOUD}"
-log "SSH ports:    $(get_ssh_ports)"
+log "SSH ports:    ${CURRENT_SSH_PORTS}"
 
 # ============================================================
-# QUESTIONNAIRE (все вопросы сразу, дальше установка идёт сама)
+# QUESTIONNAIRE
 # ============================================================
 
-section "НАСТРОЙКА"
+section "$(L "НАСТРОЙКА — ответьте на вопросы, дальше установка пойдёт сама" \
+             "SETUP — answer the questions, installation then runs on its own")"
+
+# ---------------- SSH ----------------
 
 mapfile -t KEY_FILES < <(find_ssh_key_files)
 
+echo -e "${BOLD}$(L "Вход по SSH-ключу" "SSH key login")${NC}"
+echo
 if [[ "${#KEY_FILES[@]}" -gt 0 ]]; then
-    info "Найдены SSH-ключи:"
-    printf '  %s\n' "${KEY_FILES[@]}"
-    DEF_KEY_EXISTS="y"
-elif [[ "$CLOUD" == "aws" ]]; then
-    DEF_KEY_EXISTS="y"
+    L "  На сервере уже есть SSH-ключи:" "  SSH keys already present on this server:"; echo
+    show_existing_keys "${KEY_FILES[@]}"
+    DEF_SSH_CHOICE=1
 else
-    info "SSH-ключи не найдены."
-    DEF_KEY_EXISTS="n"
+    L "  На сервере НЕ найдено ни одного SSH-ключа (вход сейчас, скорее всего, по паролю)." \
+      "  NO SSH keys found on this server (login is probably by password right now)."; echo
+    DEF_SSH_CHOICE=2
 fi
 
 if root_keys_blocked; then
-    warning "Вход root по ключу заблокирован провайдером (AWS: 'Please login as ...')."
-    warning "Вы заходите под обычным пользователем — это нормально."
+    echo
+    warning "$(L "Провайдер запретил вход под root по ключу (AWS: 'Please login as ...'). Вы входите под обычным пользователем — это нормально." \
+                 "The provider blocks root key login (AWS: 'Please login as ...'). You log in as a regular user — that is fine.")"
 fi
 
-if ask_yn "SSH-доступ по ключу уже настроен (AWS / ключ провайдера)? Ничего не трогать?" "$DEF_KEY_EXISTS"; then
-    DO_SSH_KEY=0
-else
-    DO_SSH_KEY=1
-fi
+SSH_CHOICE="$(ask_choice \
+    "$(L "Что сделать с SSH-ключами?" "What to do with SSH keys?")" \
+    "$DEF_SSH_CHOICE" \
+    "$(L "Ничего не менять — мой ключ уже работает (например, AWS или ключ добавлен провайдером)" \
+         "Change nothing — my key already works (e.g. AWS or key added by the provider)")" \
+    "$(L "Добавить мой публичный ключ для пользователя root" \
+         "Add my public key for the root user")")"
 
+[[ "$SSH_CHOICE" == "2" ]] && DO_SSH_KEY=1 || DO_SSH_KEY=0
+
+# ---------------- SSH port ----------------
+
+echo
+if [[ "$CLOUD" == "aws" ]]; then
+    warning "$(L "AWS: новый SSH-порт нужно вручную открыть в Security Group, иначе доступ к серверу пропадёт." \
+                 "AWS: a new SSH port must be opened manually in the Security Group, or you will lose access.")"
+fi
 DEF_SSH_PORT="y"
 [[ "$CLOUD" == "aws" || "$DO_SSH_KEY" -eq 0 ]] && DEF_SSH_PORT="n"
-if [[ "$CLOUD" == "aws" ]]; then
-    warning "AWS: при смене SSH-порта нужно открыть его в Security Group, иначе потеряете доступ."
-fi
-ask_yn "Сменить SSH-порт (ssh-port.sh)?" "$DEF_SSH_PORT" && DO_SSH_PORT=1 || DO_SSH_PORT=0
+ask_yn "$(L "Сменить SSH-порт (сейчас: ${CURRENT_SSH_PORTS:-22})?" \
+            "Change SSH port (current: ${CURRENT_SSH_PORTS:-22})?")" "$DEF_SSH_PORT" \
+    && DO_SSH_PORT=1 || DO_SSH_PORT=0
+
+# ---------------- Kernel / BBR ----------------
 
 if [[ "$(uname -m)" == "x86_64" ]]; then
-    ask_yn "Установить ядро XanMod + BBRv3?" "y" && DO_XANMOD=1 || DO_XANMOD=0
+    ask_yn "$(L "Установить ядро XanMod с BBRv3 (ускорение сети, нужна перезагрузка)?" \
+                "Install XanMod kernel with BBRv3 (faster networking, reboot required)?")" "y" \
+        && DO_XANMOD=1 || DO_XANMOD=0
 else
-    info "Архитектура $(uname -m): XanMod недоступен."
+    info "$(L "Архитектура $(uname -m): XanMod недоступен, шаг пропущен." \
+              "Architecture $(uname -m): XanMod is unavailable, step skipped.")"
     DO_XANMOD=0
 fi
 
-DEF_BBR_SCRIPT="y"
-[[ "$DO_XANMOD" -eq 1 ]] && DEF_BBR_SCRIPT="n"
-ask_yn "Запустить сторонний bbrv3.sh (opiran)? Не нужен, если ставим XanMod" "$DEF_BBR_SCRIPT" \
-    && DO_BBR_SCRIPT=1 || DO_BBR_SCRIPT=0
+if [[ "$DO_XANMOD" -eq 1 ]]; then
+    DO_BBR_SCRIPT=0
+else
+    ask_yn "$(L "Включить BBRv3 сторонним скриптом (opiran bbrv3.sh)?" \
+                "Enable BBRv3 with third-party script (opiran bbrv3.sh)?")" "y" \
+        && DO_BBR_SCRIPT=1 || DO_BBR_SCRIPT=0
+fi
 
-ask_yn "Установить dashboard?" "y" && DO_DASHBOARD=1 || DO_DASHBOARD=0
+# ---------------- Other steps ----------------
 
-DEF_SWAP="y"
-swapon --show --noheadings 2>/dev/null | grep -q . && DEF_SWAP="n"
-ask_yn "Настроить swap?" "$DEF_SWAP" && DO_SWAP=1 || DO_SWAP=0
+ask_yn "$(L "Установить приветственный дашборд (информация о сервере при входе)?" \
+            "Install login dashboard (server info shown on login)?")" "y" \
+    && DO_DASHBOARD=1 || DO_DASHBOARD=0
 
-ask_yn "Установить Fail2Ban?" "y" && DO_F2B=1 || DO_F2B=0
-ask_yn "Запустить security.sh (hardening SSH)?" "y" && DO_SECURITY=1 || DO_SECURITY=0
-ask_yn "Установить Remnanode?" "y" && DO_REMNANODE=1 || DO_REMNANODE=0
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    DEF_SWAP="n"
+    SWAP_NOTE="$(L "swap уже есть" "swap already exists")"
+else
+    DEF_SWAP="y"
+    SWAP_NOTE="$(L "swap сейчас нет" "no swap right now")"
+fi
+ask_yn "$(L "Настроить swap-файл (${SWAP_NOTE})?" "Configure swap file (${SWAP_NOTE})?")" "$DEF_SWAP" \
+    && DO_SWAP=1 || DO_SWAP=0
 
-if ask_yn "Настроить и включить UFW?" "y"; then
+ask_yn "$(L "Установить Fail2Ban (блокировка перебора паролей)?" \
+            "Install Fail2Ban (blocks brute-force attempts)?")" "y" \
+    && DO_F2B=1 || DO_F2B=0
+
+ask_yn "$(L "Усилить защиту SSH (security.sh: отключает вход по паролю, работает только по ключу)?" \
+            "Harden SSH (security.sh: disables password login, key-only access)?")" "y" \
+    && DO_SECURITY=1 || DO_SECURITY=0
+
+ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")" "y" \
+    && DO_REMNANODE=1 || DO_REMNANODE=0
+
+# ---------------- UFW ----------------
+
+if ask_yn "$(L "Включить файрвол UFW (закрыть все порты, кроме нужных)?" \
+               "Enable UFW firewall (close all ports except required ones)?")" "y"; then
     DO_UFW=1
-    NODE_PORT="$(ask_input "Порт ноды (NODE_PORT; из ${REMNANODE_ENV}, если есть)" "${NODE_PORT:-2222}")"
-    PANEL_IP="$(ask_input "IP панели — открыть порт ноды только для неё (пусто = для всех)" "${PANEL_IP:-}")"
-    UFW_EXTRA_PORTS="$(ask_input "Доп. порты через запятую" "${UFW_EXTRA_PORTS:-443}")"
+    NODE_PORT="$(ask_input "$(L "Порт ноды для связи с панелью (NODE_PORT)" \
+                                "Node port for panel connection (NODE_PORT)")" "${NODE_PORT:-2222}")"
+    PANEL_IP="$(ask_input "$(L "IP панели: порт ноды будет открыт только для него (Enter — открыть для всех)" \
+                               "Panel IP: node port will be open only to it (Enter — open to everyone)")" "${PANEL_IP:-}")"
+    UFW_EXTRA_PORTS="$(ask_input "$(L "Дополнительные открытые порты через запятую" \
+                                      "Extra open ports, comma-separated")" "${UFW_EXTRA_PORTS:-443}")"
 else
     DO_UFW=0
+fi
+
+# ---------------- Confirm ----------------
+
+yn_word() { [[ "$1" -eq 1 ]] && L "да" "yes" || L "нет" "no"; }
+
+section "$(L "ПЛАН УСТАНОВКИ" "INSTALLATION PLAN")"
+echo "  $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
+echo "  $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")"
+echo "  XanMod + BBRv3            : $(yn_word "$DO_XANMOD")"
+echo "  bbrv3.sh (opiran)         : $(yn_word "$DO_BBR_SCRIPT")"
+echo "  $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
+echo "  Swap                      : $(yn_word "$DO_SWAP")"
+echo "  Fail2Ban                  : $(yn_word "$DO_F2B")"
+echo "  $(L "Защита SSH (security.sh) " "SSH hardening            "): $(yn_word "$DO_SECURITY")"
+echo "  Remnanode                 : $(yn_word "$DO_REMNANODE")"
+echo "  UFW                       : $(yn_word "$DO_UFW")"
+if [[ "$DO_UFW" -eq 1 ]]; then
+    echo "      NODE_PORT : ${NODE_PORT}"
+    echo "      PANEL_IP  : ${PANEL_IP:-$(L "любой" "any")}"
+    echo "      $(L "доп. порты" "extra    ") : ${UFW_EXTRA_PORTS}"
+fi
+echo
+
+if ! ask_yn "$(L "Начать установку?" "Start installation?")" "y"; then
+    info "$(L "Отменено пользователем." "Cancelled by user.")"
+    exit 0
 fi
 
 # ============================================================
@@ -693,16 +962,14 @@ fi
 
 if ! apt_get install curl wget ca-certificates gnupg lsb-release \
         apt-transport-https util-linux psmisc; then
-    error "Failed to install required packages."
+    error "$(L "Не удалось установить базовые пакеты." "Failed to install required packages.")"
     exit 1
 fi
 
 apt_get upgrade || { warning "apt-get upgrade failed."; INSTALL_FAILED=1; }
 
-ensure_ssh_server || { error "Не удалось установить openssh-server."; INSTALL_FAILED=1; }
+ensure_ssh_server || { error "openssh-server install failed."; INSTALL_FAILED=1; }
 
-# UFW ставим всегда: на части нод его нет, а внешние скрипты (security/f2b)
-# могут на него рассчитывать.
 run_local "00-ufw-install" ensure_ufw
 
 # ============================================================
@@ -737,28 +1004,19 @@ fi
 
 if [[ "$DO_SSH_PORT" -eq 1 ]]; then
     run_remote "03-ssh-port" "${DIGNEZZZ_BASE}/ssh-port.sh"
-    ensure_ufw >/dev/null 2>&1 || true   # сразу разрешить новый порт в UFW
+    ensure_ufw >/dev/null 2>&1 || true
 else
     skip_step "03-ssh-port"
 fi
-
-run_optional() {
-    local flag="$1" name="$2" url="$3"
-    if [[ "$flag" -eq 1 ]]; then
-        run_remote "$name" "$url"
-    else
-        skip_step "$name"
-    fi
-}
 
 run_optional "$DO_DASHBOARD" "04-dashboard" "${DIGNEZZZ_BASE}/dashboard.sh"
 run_optional "$DO_SWAP"      "05-swap"      "${DIGNEZZZ_BASE}/swap.sh"
 run_optional "$DO_F2B"       "06-f2b"       "${DIGNEZZZ_BASE}/f2b.sh"
 
 if [[ "$DO_SECURITY" -eq 1 ]]; then
-    # Защита от блокировки: hardening обычно отключает вход по паролю.
     if [[ -z "$(find_ssh_key_files)" ]]; then
-        error "На сервере нет ни одного SSH-ключа — security.sh пропущен, чтобы не потерять доступ."
+        error "$(L "На сервере нет ни одного SSH-ключа — security.sh пропущен, иначе вы потеряете доступ." \
+                   "No SSH keys on this server — security.sh skipped, otherwise you would lose access.")"
         FAILED_STEPS+=("07-security (no ssh key)")
         INSTALL_FAILED=1
     else
@@ -795,7 +1053,7 @@ fi
 section "FINAL SYSTEM UPDATE"
 
 if apt_get update && apt_get upgrade; then
-    success "System is up to date."
+    success "$(L "Система обновлена." "System is up to date.")"
 else
     warning "Final update/upgrade failed."
     INSTALL_FAILED=1
@@ -836,7 +1094,11 @@ echo "UFW          : $(ufw status 2>/dev/null | head -n1)"
 
 echo
 echo "Swap:"
-swapon --show 2>/dev/null | grep -q . && swapon --show || echo "  No active swap"
+if swapon --show --noheadings 2>/dev/null | grep -q .; then
+    swapon --show
+else
+    echo "  No active swap"
+fi
 
 echo
 echo "Remnanode:"
@@ -847,38 +1109,42 @@ else
     echo "  Container not found"
 fi
 
-section "INSTALLATION SUMMARY"
+section "$(L "ИТОГ" "SUMMARY")"
 
-echo "Completed:"
-if [[ "${#COMPLETED_STEPS[@]}" -eq 0 ]]; then echo "  None"; fi
+echo "$(L "Выполнено" "Completed"):"
+[[ "${#COMPLETED_STEPS[@]}" -eq 0 ]] && echo "  -"
 for s in "${COMPLETED_STEPS[@]}"; do echo -e "  ${GREEN}[OK]${NC} $s"; done
 
 echo
-echo "Skipped:"
-if [[ "${#SKIPPED_STEPS[@]}" -eq 0 ]]; then echo "  None"; fi
+echo "$(L "Пропущено" "Skipped"):"
+[[ "${#SKIPPED_STEPS[@]}" -eq 0 ]] && echo "  -"
 for s in "${SKIPPED_STEPS[@]}"; do echo -e "  ${YELLOW}[SKIP]${NC} $s"; done
 
 echo
-echo "Failed:"
-if [[ "${#FAILED_STEPS[@]}" -eq 0 ]]; then echo -e "  ${GREEN}None${NC}"; fi
+echo "$(L "С ошибками" "Failed"):"
+[[ "${#FAILED_STEPS[@]}" -eq 0 ]] && echo -e "  ${GREEN}-${NC}"
 for s in "${FAILED_STEPS[@]}"; do echo -e "  ${RED}[FAILED]${NC} $s"; done
 
 echo
-echo "Reboot required : ${REBOOT_REQUIRED}"
-echo "Master log      : ${MASTER_LOG}"
-echo "Step logs       : ${LOG_DIR}/*.log"
-echo "Backups         : ${BACKUP_DIR}"
+echo "$(L "Нужна перезагрузка" "Reboot required") : ${REBOOT_REQUIRED}"
+echo "$(L "Общий лог         " "Master log       ") : ${MASTER_LOG}"
+echo "$(L "Логи шагов        " "Step logs        ") : ${LOG_DIR}/*.log"
+echo "$(L "Резервные копии   " "Backups          ") : ${BACKUP_DIR}"
 echo
 
 if [[ "$REBOOT_REQUIRED" == "YES" ]]; then
-    warning "Нужна перезагрузка (reboot). Автоматически сервер НЕ перезагружается."
-    [[ "$DO_XANMOD" -eq 1 ]] && warning "После reboot проверьте: uname -r (должно содержать xanmod) и sysctl net.ipv4.tcp_congestion_control"
+    warning "$(L "Нужна перезагрузка: выполните reboot (автоматически сервер НЕ перезагружается)." \
+                 "Reboot required: run reboot (the server is NOT rebooted automatically).")"
+    if [[ "$DO_XANMOD" -eq 1 ]]; then
+        warning "$(L "После перезагрузки проверьте: uname -r (должно содержать xanmod) и sysctl net.ipv4.tcp_congestion_control (bbr)" \
+                     "After reboot check: uname -r (should contain xanmod) and sysctl net.ipv4.tcp_congestion_control (bbr)")"
+    fi
 fi
 
 if [[ "$INSTALL_FAILED" -ne 0 ]]; then
-    echo -e "${RED}INSTALLATION COMPLETED WITH ERRORS${NC} — см. логи в ${LOG_DIR}"
+    echo -e "${RED}$(L "УСТАНОВКА ЗАВЕРШЕНА С ОШИБКАМИ" "INSTALLATION COMPLETED WITH ERRORS")${NC} — ${LOG_DIR}"
     exit 1
 fi
 
-echo -e "${GREEN}ALL INSTALLATION STEPS COMPLETED${NC}"
+echo -e "${GREEN}$(L "ВСЕ ШАГИ ВЫПОЛНЕНЫ" "ALL STEPS COMPLETED")${NC}"
 exit 0
