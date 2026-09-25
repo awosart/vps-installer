@@ -2,11 +2,13 @@
 # ============================================================
 # XanMod Kernel Installer
 # 1) официальный репозиторий deb.xanmod.org
-# 2) если он заблокирован (403 на IP AWS и др.) — пакеты с SourceForge
+# 2) если он заблокирован (403 на IP AWS и др.) — зеркало в GitHub Releases
+#    (наполняется workflow .github/workflows/xanmod-mirror.yml)
+# 3) затем SourceForge
 #
 # Env:
-#   XANMOD_BRANCH=main|lts   ветка для SourceForge (по умолчанию main)
-#   XANMOD_SOURCE=auto|repo|sourceforge
+#   XANMOD_BRANCH=main|lts   ветка (по умолчанию main)
+#   XANMOD_SOURCE=auto|repo|github|sourceforge
 # https://github.com/awosart/vps-installer
 # ============================================================
 
@@ -23,6 +25,7 @@ KEYSERVER_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=
 SF_RSS="https://sourceforge.net/projects/xanmod/rss?path=/releases/${XANMOD_BRANCH}&limit=500"
 UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 BBR_SYSCTL="/etc/sysctl.d/99-bbr.conf"
+GH_MIRROR="https://github.com/awosart/vps-installer/releases/latest/download"
 
 WORK="$(mktemp -d /tmp/xanmod.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
@@ -96,6 +99,33 @@ clean_repo() {
         -exec sed -i '/deb\.xanmod\.org/d' {} + 2>/dev/null || true
 }
 
+# Ubuntu грузит ядро с наибольшей версией. Если XanMod старше по номеру,
+# чем штатное (например, 6.x против 7.0-aws), явно делаем его ядром по умолчанию.
+set_default_kernel() {
+    local kver="$1" newest cfg="/boot/grub/grub.cfg" submenu entry
+
+    newest="$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
+    if [[ "$newest" == "$kver" ]]; then
+        ok "XanMod ${kver} is the newest kernel — it will boot by default."
+        return 0
+    fi
+
+    warn "Newest kernel is ${newest}, XanMod is ${kver}: setting XanMod as GRUB default."
+
+    submenu="$(grep -m1 -oP "^submenu '\K[^']+" "$cfg")"
+    entry="$(grep -oP "^\s*menuentry '\K[^']*${kver//./\\.}[^']*" "$cfg" | grep -v -i recovery | head -n1)"
+
+    if [[ -z "$submenu" || -z "$entry" ]]; then
+        warn "Could not find GRUB entry for ${kver}. Default kernel NOT changed."
+        return 1
+    fi
+
+    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+    update-grub >/dev/null 2>&1
+    grub-set-default "${submenu}>${entry}"
+    ok "GRUB default: $(grub-editenv list | grep saved_entry)"
+}
+
 finish() {
     command -v update-grub >/dev/null 2>&1 && update-grub
 
@@ -114,6 +144,8 @@ finish() {
     else
         die "Kernel or initrd for '${kver}' not found in /boot — DO NOT reboot, check the output above."
     fi
+
+    set_default_kernel "$kver"
 
     echo
     echo "============================================================"
@@ -160,7 +192,36 @@ install_from_repo() {
 }
 
 # ------------------------------------------------------------
-# 2. SourceForge (.deb)
+# 2. GitHub Releases mirror
+# ------------------------------------------------------------
+
+install_from_github() {
+    local name="xanmod-${XANMOD_BRANCH}-${LEVEL}"
+
+    [[ "$LEVEL" == "x64v1" ]] && { warn "x64v1 is not mirrored on GitHub."; return 1; }
+
+    info "Downloading from GitHub mirror (${name})..."
+
+    fetch "${GH_MIRROR}/SHA256SUMS"          "${WORK}/SHA256SUMS"          || { warn "GitHub mirror not available (run the 'XanMod mirror' workflow)."; return 1; }
+    fetch "${GH_MIRROR}/VERSIONS.txt"        "${WORK}/VERSIONS.txt"        || true
+    fetch "${GH_MIRROR}/${name}-image.deb"   "${WORK}/${name}-image.deb"   || { warn "Mirror has no ${name}-image.deb"; return 1; }
+    fetch "${GH_MIRROR}/${name}-headers.deb" "${WORK}/${name}-headers.deb" || { warn "Mirror has no ${name}-headers.deb"; return 1; }
+
+    [[ -s "${WORK}/VERSIONS.txt" ]] && grep "^${name}:" "${WORK}/VERSIONS.txt" | sed 's/^/  /'
+
+    if ! (cd "$WORK" && grep -E " ${name}-(image|headers)\.deb$" SHA256SUMS | sha256sum -c -); then
+        warn "Checksum mismatch — packages rejected."
+        return 1
+    fi
+
+    dpkg -i "${WORK}/${name}-image.deb" "${WORK}/${name}-headers.deb" || apt-get -f install -y -q || return 1
+
+    warn "Installed without a repository: kernel updates will NOT arrive via apt. Re-run this script to update."
+    return 0
+}
+
+# ------------------------------------------------------------
+# 3. SourceForge (.deb)
 # ------------------------------------------------------------
 
 install_from_sourceforge() {
@@ -203,15 +264,22 @@ install_from_sourceforge() {
 case "$XANMOD_SOURCE" in
     repo)
         install_from_repo || die "Repository install failed." ;;
+    github)
+        install_from_github || die "GitHub mirror install failed." ;;
     sourceforge)
         install_from_sourceforge || die "SourceForge install failed." ;;
     *)
         if repo_reachable && install_from_repo; then
             ok "Installed from official repository."
         else
-            warn "deb.xanmod.org is blocked for this IP (or install failed). Falling back to SourceForge."
-            install_from_sourceforge || die "SourceForge install failed. Download the .deb files on another machine and install with dpkg -i."
-            ok "Installed from SourceForge."
+            warn "deb.xanmod.org is blocked for this IP (or install failed). Trying GitHub mirror."
+            if install_from_github; then
+                ok "Installed from GitHub mirror."
+            else
+                warn "Trying SourceForge."
+                install_from_sourceforge || die "All sources failed. Run the 'XanMod mirror' workflow in GitHub Actions and try again."
+                ok "Installed from SourceForge."
+            fi
         fi
         ;;
 esac
