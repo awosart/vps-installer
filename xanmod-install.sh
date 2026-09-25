@@ -1,287 +1,156 @@
 #!/usr/bin/env bash
-# ============================================================
-# XanMod Kernel Installer
-# 1) официальный репозиторий deb.xanmod.org
-# 2) если он заблокирован (403 на IP AWS и др.) — зеркало в GitHub Releases
-#    (наполняется workflow .github/workflows/xanmod-mirror.yml)
-# 3) затем SourceForge
+# Установка ядра XanMod на Ubuntu/Debian.
+# Использование: sudo bash xanmod-install.sh [main|lts] [--with-dkms]
+#   main        — основная ветка (по умолчанию)
+#   lts         — LTS-ветка
+#   --with-dkms — зависимости для сборки внешних модулей (NVIDIA, VirtualBox и т.п.)
 #
-# Env:
-#   XANMOD_BRANCH=main|lts   ветка (по умолчанию main)
-#   XANMOD_SOURCE=auto|repo|github|sourceforge
-# https://github.com/awosart/vps-installer
-# ============================================================
+# Важно: deb.xanmod.org / dl.xanmod.org отвечают 403 на curl/wget с облачных IP
+# (AWS/Lightsail), но пускают apt. Поэтому ключ при необходимости берётся
+# с keyserver.ubuntu.com, а репозиторий проверяется самим apt.
 
-set -uo pipefail
+set -euo pipefail
 
-XANMOD_BRANCH="${XANMOD_BRANCH:-main}"
-XANMOD_SOURCE="${XANMOD_SOURCE:-auto}"
-
-KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
-LIST="/etc/apt/sources.list.d/xanmod-release.list"
 KEY_FPR="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 KEY_URL="https://dl.xanmod.org/archive.key"
-KEYSERVER_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${KEY_FPR}"
-SF_RSS="https://sourceforge.net/projects/xanmod/rss?path=/releases/${XANMOD_BRANCH}&limit=500"
-UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+SOURCES="/etc/apt/sources.list.d/xanmod-release.list"
 BBR_SYSCTL="/etc/sysctl.d/99-bbr.conf"
-GH_MIRROR="https://github.com/awosart/vps-installer/releases/latest/download"
 
-WORK="$(mktemp -d /tmp/xanmod.XXXXXX)"
-trap 'rm -rf "$WORK"' EXIT
+BRANCH="main"
+WITH_DKMS=0
+for arg in "$@"; do
+  case "$arg" in
+    main|lts) BRANCH="$arg" ;;
+    --with-dkms) WITH_DKMS=1 ;;
+    *) echo "Неизвестный аргумент: $arg"; exit 1 ;;
+  esac
+done
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
-info() { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+log()  { echo -e "\e[1;32m==>\e[0m $*"; }
+warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
+die()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; exit 1; }
 
-echo "============================================================"
-echo " XanMod Kernel Installer"
-echo "============================================================"
-
-# ------------------------------------------------------------
-# Checks
-# ------------------------------------------------------------
-
-[[ "$EUID" -eq 0 ]] || die "Run as root."
-[[ "$(uname -m)" == "x86_64" ]] || die "XanMod is x86_64 only (this is $(uname -m))."
-
-# shellcheck disable=SC1091
-source /etc/os-release
-[[ "$ID" == "ubuntu" || "$ID" == "debian" ]] || die "Ubuntu/Debian only."
-CODENAME="${VERSION_CODENAME:-}"
-[[ -n "$CODENAME" ]] || die "Cannot detect codename."
-
-info "OS: ${PRETTY_NAME} (${CODENAME}), kernel: $(uname -r)"
+# --- Проверки ---
+[[ $EUID -eq 0 ]] || die "Запустите через sudo."
+[[ "$(uname -m)" == "x86_64" ]] || die "XanMod поддерживает только x86_64."
 
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-apt-get install -y -q ca-certificates curl wget gnupg >/dev/null || die "Failed to install dependencies."
 
-# ------------------------------------------------------------
-# CPU level (локально, без dl.xanmod.org)
-# ------------------------------------------------------------
+log "Устанавливаю необходимые пакеты..."
+apt-get update -qq
+apt-get install -y -qq curl gnupg dirmngr lsb-release ca-certificates >/dev/null
 
-FLAGS="$(grep -m1 '^flags' /proc/cpuinfo)"
-has() { [[ " $FLAGS " == *" $1 "* ]]; }
+CODENAME="$(lsb_release -sc)"
+log "Дистрибутив: $CODENAME, текущее ядро: $(uname -r)"
 
-if has avx2 && has bmi1 && has bmi2 && has fma && has movbe && has f16c; then
-    LEVEL="x64v3"
-elif has sse4_2 && has popcnt && has ssse3 && has cx16; then
-    LEVEL="x64v2"
+# --- Очистка старых записей XanMod ---
+rm -f "$SOURCES"
+find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.list' \
+  -exec sed -i '/deb\.xanmod\.org/d' {} + 2>/dev/null || true
+
+# --- Ключ репозитория ---
+log "Получаю ключ XanMod..."
+install -d -m 755 /etc/apt/keyrings
+TMP_GNUPG="$(mktemp -d)"
+trap 'rm -rf "$TMP_GNUPG"' EXIT
+chmod 700 "$TMP_GNUPG"
+
+KEY_OK=0
+# Способ 1: с сайта XanMod (может отдавать 403 для облачных IP)
+if curl -fsSL "$KEY_URL" -o "$TMP_GNUPG/archive.key" 2>/dev/null \
+   && gpg --homedir "$TMP_GNUPG" --import "$TMP_GNUPG/archive.key" 2>/dev/null; then
+  KEY_OK=1
+  log "Ключ скачан с dl.xanmod.org"
 else
-    LEVEL="x64v1"
+  warn "dl.xanmod.org недоступен, беру ключ с keyserver.ubuntu.com"
+  if gpg --homedir "$TMP_GNUPG" --keyserver hkps://keyserver.ubuntu.com \
+         --recv-keys "$KEY_FPR" 2>/dev/null; then
+    KEY_OK=1
+  fi
 fi
-ok "CPU level: ${LEVEL}"
+[[ $KEY_OK -eq 1 ]] || die "Не удалось получить ключ XanMod."
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+# Проверяем полный отпечаток и экспортируем в формат, понятный apt
+gpg --homedir "$TMP_GNUPG" --list-keys "$KEY_FPR" >/dev/null 2>&1 \
+  || die "Полученный ключ не совпадает с ожидаемым отпечатком $KEY_FPR."
+gpg --homedir "$TMP_GNUPG" --export "$KEY_FPR" > "$KEYRING"
+chmod 644 "$KEYRING"
+[[ -s "$KEYRING" ]] || die "Файл ключа пустой: $KEYRING"
 
-fetch() {   # url out
-    rm -f "$2"
-    wget -q -T 30 -t 2 -O "$2" "$1" 2>/dev/null && [[ -s "$2" ]] && return 0
-    curl -fsSL --retry 2 --connect-timeout 20 -A "$UA" -o "$2" "$1" 2>/dev/null && [[ -s "$2" ]] && return 0
-    rm -f "$2"
-    return 1
-}
+# --- Репозиторий ---
+log "Добавляю репозиторий..."
+echo "deb [signed-by=$KEYRING] http://deb.xanmod.org $CODENAME main" > "$SOURCES"
 
-repo_reachable() {
-    local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 \
-        "http://deb.xanmod.org/dists/${CODENAME}/Release")"
-    [[ "$code" == "200" ]]
-}
+UPDATE_OUT="$(apt-get update 2>&1)" || true
+echo "$UPDATE_OUT"
+if grep -qE "NO_PUBKEY|is not signed" <<<"$UPDATE_OUT"; then
+  die "apt не принимает подпись репозитория XanMod."
+fi
+if grep -qE "xanmod.*(403|Forbidden)" <<<"$UPDATE_OUT"; then
+  rm -f "$SOURCES"
+  die "deb.xanmod.org отказал apt (403). Репозиторий удалён."
+fi
 
-clean_repo() {
-    rm -f "$LIST"
-    find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.list' \
-        -exec sed -i '/deb\.xanmod\.org/d' {} + 2>/dev/null || true
-}
+# --- Выбор уровня процессора ---
+PSABI="$(/lib64/ld-linux-x86-64.so.2 --help 2>/dev/null || true)"
+if   grep -q "x86-64-v3 (supported" <<<"$PSABI"; then LEVEL="x64v3"   # v4 тоже ставим как v3
+elif grep -q "x86-64-v2 (supported" <<<"$PSABI"; then LEVEL="x64v2"
+else LEVEL="x64v1"
+fi
+log "Уровень процессора: $LEVEL"
 
-# Ubuntu грузит ядро с наибольшей версией. Если XanMod старше по номеру,
-# чем штатное (например, 6.x против 7.0-aws), явно делаем его ядром по умолчанию.
-set_default_kernel() {
-    local kver="$1" newest cfg="/boot/grub/grub.cfg" submenu entry
+if [[ "$BRANCH" == "lts" || "$LEVEL" == "x64v1" ]]; then
+  PKG="linux-xanmod-lts-$LEVEL"
+else
+  PKG="linux-xanmod-$LEVEL"
+fi
 
-    newest="$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
-    if [[ "$newest" == "$kver" ]]; then
-        ok "XanMod ${kver} is the newest kernel — it will boot by default."
-        return 0
-    fi
+apt-cache show "$PKG" >/dev/null 2>&1 \
+  || die "Пакет $PKG не найден. Доступные: $(apt-cache search --names-only '^linux-xanmod' | cut -d' ' -f1 | xargs)"
 
-    warn "Newest kernel is ${newest}, XanMod is ${kver}: setting XanMod as GRUB default."
+# --- Установка ---
+log "Устанавливаю $PKG..."
+apt-get install -y "$PKG"
 
-    submenu="$(grep -m1 -oP "^submenu '\K[^']+" "$cfg")"
-    entry="$(grep -oP "^\s*menuentry '\K[^']*${kver//./\\.}[^']*" "$cfg" | grep -v -i recovery | head -n1)"
+if [[ $WITH_DKMS -eq 1 ]]; then
+  log "Устанавливаю зависимости для DKMS..."
+  apt-get install -y --no-install-recommends dkms libdw-dev clang lld llvm
+fi
 
-    if [[ -z "$submenu" || -z "$entry" ]]; then
-        warn "Could not find GRUB entry for ${kver}. Default kernel NOT changed."
-        return 1
-    fi
+update-grub >/dev/null 2>&1 || true
 
-    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
-    update-grub >/dev/null 2>&1
-    grub-set-default "${submenu}>${entry}"
-    ok "GRUB default: $(grub-editenv list | grep saved_entry)"
-}
+# --- Проверка ядра и выбор его по умолчанию ---
+KVER="$(ls /boot/vmlinuz-*xanmod* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
+[[ -n "$KVER" ]] || die "Ядро XanMod не найдено в /boot."
+[[ -f "/boot/initrd.img-$KVER" ]] || die "Нет /boot/initrd.img-$KVER — НЕ перезагружайтесь."
 
-finish() {
-    command -v update-grub >/dev/null 2>&1 && update-grub
+NEWEST="$(ls /boot/vmlinuz-* | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
+if [[ "$NEWEST" == "$KVER" ]]; then
+  log "XanMod $KVER — самое новое ядро, загрузится по умолчанию."
+else
+  # Ubuntu грузит ядро с наибольшей версией; XanMod младше по номеру
+  # (например, 6.x против 7.0-aws), поэтому выбираем его явно.
+  warn "Самое новое ядро — $NEWEST. Делаю ядром по умолчанию XanMod $KVER."
+  CFG="/boot/grub/grub.cfg"
+  SUBMENU="$(grep -m1 -oP "^submenu '\K[^']+" "$CFG")"
+  ENTRY="$(grep -oP "^\s*menuentry '\K[^']*${KVER//./\\.}[^']*" "$CFG" | grep -vi recovery | head -n1)"
+  [[ -n "$SUBMENU" && -n "$ENTRY" ]] || die "Не найден пункт GRUB для $KVER."
+  sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+  update-grub >/dev/null 2>&1
+  grub-set-default "$SUBMENU>$ENTRY"
+  log "GRUB: $(grub-editenv list | grep saved_entry)"
+fi
 
-    printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_SYSCTL"
-    sysctl --system >/dev/null 2>&1 || true
+# --- BBR (в ядре XanMod это BBRv3) ---
+printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_SYSCTL"
+sysctl --system >/dev/null 2>&1 || true
 
-    echo
-    echo "Installed XanMod packages:"
-    dpkg -l | awk '/^ii  linux-(image|headers)-.*xanmod/ { print "  " $2 "  " $3 }'
-
-    local kver
-    kver="$(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { sub(/^linux-image-/, "", $2); print $2 }' | sort -V | tail -n1)"
-    echo
-    if [[ -n "$kver" && -f "/boot/vmlinuz-${kver}" && -f "/boot/initrd.img-${kver}" ]]; then
-        ok "Kernel and initrd present: /boot/vmlinuz-${kver}"
-    else
-        die "Kernel or initrd for '${kver}' not found in /boot — DO NOT reboot, check the output above."
-    fi
-
-    set_default_kernel "$kver"
-
-    echo
-    echo "============================================================"
-    echo " DONE. Before reboot on AWS/Lightsail: take a SNAPSHOT."
-    echo " Then: reboot"
-    echo " After reboot: uname -r   (contains xanmod)"
-    echo "               sysctl net.ipv4.tcp_congestion_control   (bbr)"
-    echo "============================================================"
-}
-
-# ------------------------------------------------------------
-# 1. Official repository
-# ------------------------------------------------------------
-
-install_from_repo() {
-    local pkg="linux-xanmod-${LEVEL}" raw="${WORK}/xanmod.key" fpr
-    [[ "$LEVEL" == "x64v1" ]] && pkg="linux-xanmod-lts-x64v1"
-
-    info "Trying official repository deb.xanmod.org..."
-
-    install -d -m 0755 /etc/apt/keyrings
-    if ! fetch "$KEY_URL" "$raw"; then
-        warn "dl.xanmod.org blocked, taking key from keyserver.ubuntu.com"
-        fetch "$KEYSERVER_URL" "$raw" || return 1
-    fi
-    gpg --dearmor --yes -o "$KEYRING" "$raw" 2>/dev/null || cp -f "$raw" "$KEYRING"
-    chmod 0644 "$KEYRING"
-
-    fpr="$(gpg --show-keys --with-colons "$KEYRING" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')"
-    [[ "$fpr" == "$KEY_FPR" ]] || { warn "Key fingerprint mismatch: ${fpr:-none}"; rm -f "$KEYRING"; return 1; }
-
-    clean_repo
-    echo "deb [signed-by=${KEYRING}] http://deb.xanmod.org ${CODENAME} main" > "$LIST"
-
-    if ! apt-get update -q; then
-        clean_repo; apt-get update -q >/dev/null 2>&1; return 1
-    fi
-    if ! apt-cache policy "$pkg" | grep -q 'Candidate: [0-9]'; then
-        warn "${pkg} not available for ${CODENAME}"
-        clean_repo; apt-get update -q >/dev/null 2>&1; return 1
-    fi
-
-    apt-get install -y -q "$pkg"
-}
-
-# ------------------------------------------------------------
-# 2. GitHub Releases mirror
-# ------------------------------------------------------------
-
-install_from_github() {
-    local name="xanmod-${XANMOD_BRANCH}-${LEVEL}"
-
-    [[ "$LEVEL" == "x64v1" ]] && { warn "x64v1 is not mirrored on GitHub."; return 1; }
-
-    info "Downloading from GitHub mirror (${name})..."
-
-    fetch "${GH_MIRROR}/SHA256SUMS"          "${WORK}/SHA256SUMS"          || { warn "GitHub mirror not available (run the 'XanMod mirror' workflow)."; return 1; }
-    fetch "${GH_MIRROR}/VERSIONS.txt"        "${WORK}/VERSIONS.txt"        || true
-    fetch "${GH_MIRROR}/${name}-image.deb"   "${WORK}/${name}-image.deb"   || { warn "Mirror has no ${name}-image.deb"; return 1; }
-    fetch "${GH_MIRROR}/${name}-headers.deb" "${WORK}/${name}-headers.deb" || { warn "Mirror has no ${name}-headers.deb"; return 1; }
-
-    [[ -s "${WORK}/VERSIONS.txt" ]] && grep "^${name}:" "${WORK}/VERSIONS.txt" | sed 's/^/  /'
-
-    if ! (cd "$WORK" && grep -E " ${name}-(image|headers)\.deb$" SHA256SUMS | sha256sum -c -); then
-        warn "Checksum mismatch — packages rejected."
-        return 1
-    fi
-
-    dpkg -i "${WORK}/${name}-image.deb" "${WORK}/${name}-headers.deb" || apt-get -f install -y -q || return 1
-
-    warn "Installed without a repository: kernel updates will NOT arrive via apt. Re-run this script to update."
-    return 0
-}
-
-# ------------------------------------------------------------
-# 3. SourceForge (.deb)
-# ------------------------------------------------------------
-
-install_from_sourceforge() {
-    local rss="${WORK}/sf.rss" img_url hdr_url img_name
-
-    info "Downloading from SourceForge (branch: ${XANMOD_BRANCH}, level: ${LEVEL})..."
-
-    fetch "$SF_RSS" "$rss" || { warn "SourceForge is not reachable either."; return 1; }
-
-    # Последний linux-image нужного уровня (без -rt / -edge вариантов)
-    img_url="$(grep -oE "https://sourceforge\.net/projects/xanmod/files/releases/${XANMOD_BRANCH}/[^<\"]*/linux-image-[0-9.]+-${LEVEL}-xanmod[0-9]+_[^/<\"]*_amd64\.deb/download" "$rss" \
-        | sort -u \
-        | awk -F/ '{ print $(NF-1) "\t" $0 }' \
-        | sort -V -k1,1 | tail -n1 | cut -f2)"
-
-    [[ -n "$img_url" ]] || { warn "No ${LEVEL} linux-image found in SourceForge feed."; return 1; }
-
-    img_name="$(awk -F/ '{ print $(NF-1) }' <<<"$img_url")"
-    hdr_url="${img_url//\/linux-image-/\/linux-headers-}"
-
-    info "Image:   ${img_name}"
-    info "Headers: ${img_name/linux-image-/linux-headers-}"
-
-    fetch "$img_url" "${WORK}/image.deb"   || { warn "Failed to download image."; return 1; }
-    fetch "$hdr_url" "${WORK}/headers.deb" || { warn "Failed to download headers."; return 1; }
-
-    dpkg-deb -I "${WORK}/image.deb"   >/dev/null 2>&1 || { warn "image.deb is not a valid package."; return 1; }
-    dpkg-deb -I "${WORK}/headers.deb" >/dev/null 2>&1 || { warn "headers.deb is not a valid package."; return 1; }
-
-    dpkg -i "${WORK}/image.deb" "${WORK}/headers.deb" || apt-get -f install -y -q || return 1
-
-    warn "Installed without a repository: kernel updates will NOT arrive via apt. Re-run this script to update."
-    return 0
-}
-
-# ------------------------------------------------------------
-# Run
-# ------------------------------------------------------------
-
-case "$XANMOD_SOURCE" in
-    repo)
-        install_from_repo || die "Repository install failed." ;;
-    github)
-        install_from_github || die "GitHub mirror install failed." ;;
-    sourceforge)
-        install_from_sourceforge || die "SourceForge install failed." ;;
-    *)
-        if repo_reachable && install_from_repo; then
-            ok "Installed from official repository."
-        else
-            warn "deb.xanmod.org is blocked for this IP (or install failed). Trying GitHub mirror."
-            if install_from_github; then
-                ok "Installed from GitHub mirror."
-            else
-                warn "Trying SourceForge."
-                install_from_sourceforge || die "All sources failed. Run the 'XanMod mirror' workflow in GitHub Actions and try again."
-                ok "Installed from SourceForge."
-            fi
-        fi
-        ;;
-esac
-
-finish
+echo
+log "Готово. Установленные ядра XanMod:"
+dpkg -l | awk '/^ii/ && /xanmod/ {print "    " $2 "  " $3}'
+echo
+warn "На облачном сервере (Lightsail/EC2) сделайте снапшот ПЕРЕД перезагрузкой."
+echo "    Затем: sudo reboot"
+echo "    После: uname -r                               (должно содержать 'xanmod')"
+echo "           sysctl net.ipv4.tcp_congestion_control (должно быть bbr)"
