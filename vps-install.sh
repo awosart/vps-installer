@@ -16,7 +16,7 @@
 #   SSH_PUBLIC_KEY="ssh-ed25519 AAAA..."
 # ============================================================
 
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 
 set -o pipefail
 
@@ -34,8 +34,8 @@ DIGNEZZZ_BASE="https://dignezzz.github.io/server"
 
 XANMOD_REPO="http://deb.xanmod.org"
 XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
-XANMOD_CPU_CHECK_URL="https://dl.xanmod.org/check_x86-64_psabi.sh"
 XANMOD_KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+XANMOD_KEY_FPR="D38D7D1DA1349567ADED882D86F7D09EE734E623"
 XANMOD_LIST="/etc/apt/sources.list.d/xanmod-release.list"
 BBR_SYSCTL="/etc/sysctl.d/99-bbr.conf"
 
@@ -615,89 +615,147 @@ xanmod_clean_old_repos() {
     return 0
 }
 
-xanmod_detect_package() {
-    local out level=0
+# dl.xanmod.org иногда отвечает 403 на curl / IP дата-центров.
+# Порядок: wget (как в официальной инструкции) -> curl с браузерным User-Agent.
+# Ключ: сначала dl.xanmod.org, при 403 (облачные IP) — keyserver.ubuntu.com через gpg.
+xanmod_install_key() {
+    local gh ok=0
 
-    # check_x86-64_psabi.sh — awk-скрипт, не bash.
-    out="$(curl -fsSL --retry 3 "$XANMOD_CPU_CHECK_URL" 2>/dev/null | awk -f - 2>&1 || true)"
+    gh="$(mktemp -d)"
+    chmod 700 "$gh"
 
-    if [[ -n "$out" ]]; then
-        echo "CPU check: ${out}" >&2
-        if   grep -Eq 'x86-64-v4' <<<"$out"; then level=4
-        elif grep -Eq 'x86-64-v3' <<<"$out"; then level=3
-        elif grep -Eq 'x86-64-v2' <<<"$out"; then level=2
-        elif grep -Eq 'x86-64-v1' <<<"$out"; then level=1
-        fi
+    if curl -fsSL "$XANMOD_KEY_URL" -o "${gh}/archive.key" 2>/dev/null \
+            && gpg --homedir "$gh" --import "${gh}/archive.key" >/dev/null 2>&1; then
+        info "$(L "Ключ XanMod скачан с dl.xanmod.org." "XanMod key downloaded from dl.xanmod.org.")"
+        ok=1
+    else
+        warning "$(L "dl.xanmod.org недоступен, беру ключ с keyserver.ubuntu.com." \
+                     "dl.xanmod.org is unavailable, taking key from keyserver.ubuntu.com.")"
+        gpg --homedir "$gh" --keyserver hkps://keyserver.ubuntu.com \
+            --recv-keys "$XANMOD_KEY_FPR" >/dev/null 2>&1 && ok=1
     fi
 
-    if [[ "$level" -eq 0 ]]; then
-        local flags
-        flags="$(grep -m1 '^flags' /proc/cpuinfo)"
-        if [[ "$flags" =~ avx2 && "$flags" =~ bmi2 && "$flags" =~ fma && "$flags" =~ movbe ]]; then
-            level=3
-        elif [[ "$flags" =~ sse4_2 && "$flags" =~ popcnt && "$flags" =~ ssse3 ]]; then
-            level=2
-        else
-            level=1
-        fi
-        echo "CPU check (fallback /proc/cpuinfo): x86-64-v${level}" >&2
+    if [[ "$ok" -ne 1 ]] || ! gpg --homedir "$gh" --list-keys "$XANMOD_KEY_FPR" >/dev/null 2>&1; then
+        error "$(L "Не удалось получить ключ XanMod (отпечаток ${XANMOD_KEY_FPR})." \
+                   "Could not get the XanMod key (fingerprint ${XANMOD_KEY_FPR}).")"
+        rm -rf "$gh"
+        return 1
     fi
 
-    case "$level" in
-        3|4) echo "linux-xanmod-x64v3" ;;
-        2)   echo "linux-xanmod-x64v2" ;;
-        *)   echo "linux-xanmod-lts-x64v1" ;;
-    esac
+    install -d -m 0755 /etc/apt/keyrings
+    gpg --homedir "$gh" --export "$XANMOD_KEY_FPR" > "$XANMOD_KEYRING"
+    chmod 0644 "$XANMOD_KEYRING"
+    rm -rf "$gh"
+
+    [[ -s "$XANMOD_KEYRING" ]] || { error "Empty keyring: ${XANMOD_KEYRING}"; return 1; }
+    success "$(L "Ключ XanMod проверен" "XanMod key verified"): ${XANMOD_KEY_FPR}"
+}
+
+# Уровень CPU через загрузчик glibc — без обращения к dl.xanmod.org.
+xanmod_detect_level() {
+    local psabi flags
+    psabi="$(/lib64/ld-linux-x86-64.so.2 --help 2>/dev/null || true)"
+
+    if   grep -q "x86-64-v3 (supported" <<<"$psabi"; then echo "x64v3"; return
+    elif grep -q "x86-64-v2 (supported" <<<"$psabi"; then echo "x64v2"; return
+    elif [[ -n "$psabi" ]] && grep -q "x86-64-v" <<<"$psabi"; then echo "x64v1"; return
+    fi
+
+    # Фоллбэк по /proc/cpuinfo, если ld.so не показал уровни
+    flags="$(grep -m1 '^flags' /proc/cpuinfo)"
+    if [[ "$flags" =~ avx2 && "$flags" =~ bmi2 && "$flags" =~ fma && "$flags" =~ movbe ]]; then
+        echo "x64v3"
+    elif [[ "$flags" =~ sse4_2 && "$flags" =~ popcnt && "$flags" =~ ssse3 ]]; then
+        echo "x64v2"
+    else
+        echo "x64v1"
+    fi
+}
+
+# Ubuntu грузит ядро с наибольшей версией. Если XanMod по номеру младше
+# штатного (например, 6.x против 7.0-aws), явно делаем его ядром по умолчанию.
+xanmod_set_default_kernel() {
+    local kver newest cfg="/boot/grub/grub.cfg" submenu entry
+
+    kver="$(ls /boot/vmlinuz-*xanmod* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
+    [[ -n "$kver" ]] || { error "$(L "Ядро XanMod не найдено в /boot." "XanMod kernel not found in /boot.")"; return 1; }
+
+    if [[ ! -f "/boot/initrd.img-${kver}" ]]; then
+        error "$(L "Нет /boot/initrd.img-${kver} — НЕ перезагружайтесь." "Missing /boot/initrd.img-${kver} — DO NOT reboot.")"
+        return 1
+    fi
+
+    newest="$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -n1)"
+    if [[ "$newest" == "$kver" ]]; then
+        success "$(L "XanMod ${kver} — самое новое ядро, загрузится по умолчанию." \
+                     "XanMod ${kver} is the newest kernel and will boot by default.")"
+        return 0
+    fi
+
+    warning "$(L "Самое новое ядро — ${newest}, XanMod — ${kver}. Делаю XanMod ядром по умолчанию." \
+                 "Newest kernel is ${newest}, XanMod is ${kver}. Making XanMod the default.")"
+
+    submenu="$(grep -m1 -oP "^submenu '\K[^']+" "$cfg")"
+    entry="$(grep -oP "^\s*menuentry '\K[^']*${kver//./\\.}[^']*" "$cfg" | grep -vi recovery | head -n1)"
+
+    if [[ -z "$submenu" || -z "$entry" ]]; then
+        error "$(L "Не найден пункт GRUB для ${kver}, ядро по умолчанию не изменено." \
+                   "GRUB entry for ${kver} not found, default kernel not changed.")"
+        return 1
+    fi
+
+    sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub
+    update-grub >/dev/null 2>&1
+    grub-set-default "${submenu}>${entry}"
+    success "GRUB: $(grub-editenv list | grep saved_entry)"
 }
 
 install_xanmod() {
-    local codename="${VERSION_CODENAME:-}" pkg
+    local codename="${VERSION_CODENAME:-}" level pkg
 
     if [[ "$(uname -m)" != "x86_64" ]]; then
         warning "$(L "XanMod есть только для x86_64 (здесь $(uname -m)). Пропуск." \
                      "XanMod is x86_64 only (this is $(uname -m)). Skipping.")"
         return 0
     fi
-
-    if [[ -z "$codename" ]]; then
-        error "$(L "Не удалось определить codename дистрибутива." "Could not detect distribution codename.")"
-        return 1
-    fi
+    [[ -n "$codename" ]] || { error "Cannot detect codename."; return 1; }
 
     xanmod_clean_old_repos
-    apt_get install ca-certificates curl gnupg || return 1
+    apt_get install ca-certificates curl gnupg dirmngr || return 1
 
-    pkg="$(xanmod_detect_package)"
-    info "$(L "Выбран пакет" "Selected package"): ${pkg}"
+    xanmod_install_key || return 1
 
-    install -d -m 0755 /etc/apt/keyrings
-    if ! curl -fsSL --retry 3 "$XANMOD_KEY_URL" | gpg --dearmor --yes -o "$XANMOD_KEYRING"; then
-        error "$(L "Не удалось скачать ключ репозитория XanMod." "Failed to download XanMod repository key.")"
-        return 1
-    fi
-    chmod 0644 "$XANMOD_KEYRING"
-
+    # Важно: deb.xanmod.org отвечает 403 на curl/wget с облачных IP,
+    # но пускает apt. Поэтому доступность проверяем самим apt, а не curl.
     echo "deb [signed-by=${XANMOD_KEYRING}] ${XANMOD_REPO} ${codename} main" > "$XANMOD_LIST"
     info "Repository: $(cat "$XANMOD_LIST")"
 
-    if ! apt_get update; then
-        error "apt-get update (XanMod) failed."
-        return 1
-    fi
-
-    if ! apt-cache policy "$pkg" 2>/dev/null | grep -q 'Candidate: [0-9]'; then
-        error "$(L "Пакет ${pkg} недоступен для ${codename}. Репозиторий удалён." \
-                   "Package ${pkg} is not available for ${codename}. Repository removed.")"
+    local upd
+    upd="$(apt-get "${APT_OPTS[@]}" update 2>&1)"
+    echo "$upd"
+    if grep -qE "NO_PUBKEY|is not signed|xanmod.*(403|Forbidden)" <<<"$upd"; then
+        error "$(L "apt не может работать с репозиторием XanMod (см. вывод выше). Репозиторий удалён." \
+                   "apt cannot use the XanMod repository (see output above). Repository removed.")"
         rm -f "$XANMOD_LIST"
         apt_get update >/dev/null 2>&1 || true
         return 1
     fi
 
-    apt_get install "$pkg" || return 1
+    level="$(xanmod_detect_level)"
+    pkg="linux-xanmod-${level}"
+    [[ "$level" == "x64v1" ]] && pkg="linux-xanmod-lts-x64v1"
+    info "$(L "Уровень CPU" "CPU level"): ${level}, $(L "пакет" "package"): ${pkg}"
 
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub || warning "update-grub failed."
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+        error "$(L "Пакет ${pkg} не найден. Доступные:" "Package ${pkg} not found. Available:") \
+$(apt-cache search --names-only '^linux-xanmod' | cut -d' ' -f1 | xargs)"
+        return 1
     fi
+
+    apt_get install "$pkg" || return 1
+    update-grub >/dev/null 2>&1 || true
+
+    xanmod_set_default_kernel || return 1
 
     cat > "$BBR_SYSCTL" <<EOF
 net.core.default_qdisc = fq
@@ -706,7 +764,7 @@ EOF
     sysctl --system >/dev/null 2>&1 || true
 
     REBOOT_REQUIRED="YES"
-    success "XanMod: $(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { print $2 }' | tail -n1)"
+    success "XanMod: $(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { print $2 }' | sort -V | tail -n1)"
     return 0
 }
 
@@ -762,11 +820,37 @@ check_f2b_ssh_port() {
 # STEP: REMNANODE
 # ============================================================
 
+remnanode_running() {
+    command -v docker >/dev/null 2>&1 || return 1
+    [[ "$(docker inspect -f '{{.State.Running}}' remnanode 2>/dev/null)" == "true" ]]
+}
+
 install_remnanode() {
+    local rc
     section "08-remnanode"
     log "bash <(curl -fsSL ${REMNANODE_URL}) @ install"
+    echo
+    warning "$(L "После установки скрипт ноды сам откроет логи контейнера. Когда увидите, что нода запустилась, нажмите Ctrl+C — установка продолжится." \
+                 "After installation the node script opens container logs. Once the node is up, press Ctrl+C — the installer will continue.")"
+    echo
+
+    # Ctrl+C должен закрыть только логи ноды, а не весь установщик.
+    trap ':' INT
     bash <(curl -fsSL "$REMNANODE_URL") @ install <"$TTY_IN" >&3 2>&4
-    mark_result "08-remnanode" $?
+    rc=$?
+    trap - INT
+
+    # Код выхода ненадёжен (Ctrl+C на логах даёт 130), поэтому
+    # успех определяем по тому, запущен ли контейнер.
+    sleep 3
+    if remnanode_running; then
+        [[ "$rc" -ne 0 ]] && info "$(L "Скрипт ноды завершился с кодом ${rc} (выход из логов), но контейнер работает." \
+                                        "Node script exited with code ${rc} (logs closed), but the container is running.")"
+        mark_result "08-remnanode" 0
+    else
+        error "$(L "Контейнер remnanode не запущен." "The remnanode container is not running.")"
+        mark_result "08-remnanode" "$(( rc == 0 ? 1 : rc ))"
+    fi
 }
 
 # ============================================================
@@ -1095,7 +1179,7 @@ echo
 if [[ "$REBOOT_REQUIRED" == "YES" ]]; then
     warning "$(L "Нужна перезагрузка: выполните reboot (автоматически сервер НЕ перезагружается)." \
                  "Reboot required: run reboot (the server is NOT rebooted automatically).")"
-    if [[ "$DO_XANMOD" -eq 1 ]]; then
+    if dpkg -l 2>/dev/null | grep -q '^ii  linux-image-.*xanmod'; then
         warning "$(L "После перезагрузки проверьте: uname -r (должно содержать xanmod) и sysctl net.ipv4.tcp_congestion_control (bbr)" \
                      "After reboot check: uname -r (should contain xanmod) and sysctl net.ipv4.tcp_congestion_control (bbr)")"
     fi
