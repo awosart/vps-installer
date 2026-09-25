@@ -1,185 +1,219 @@
 #!/usr/bin/env bash
+# ============================================================
+# XanMod Kernel Installer
+# 1) официальный репозиторий deb.xanmod.org
+# 2) если он заблокирован (403 на IP AWS и др.) — пакеты с SourceForge
+#
+# Env:
+#   XANMOD_BRANCH=main|lts   ветка для SourceForge (по умолчанию main)
+#   XANMOD_SOURCE=auto|repo|sourceforge
+# https://github.com/awosart/vps-installer
+# ============================================================
 
-set -euo pipefail
+set -uo pipefail
+
+XANMOD_BRANCH="${XANMOD_BRANCH:-main}"
+XANMOD_SOURCE="${XANMOD_SOURCE:-auto}"
+
+KEYRING="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
+LIST="/etc/apt/sources.list.d/xanmod-release.list"
+KEY_FPR="D38D7D1DA1349567ADED882D86F7D09EE734E623"
+KEY_URL="https://dl.xanmod.org/archive.key"
+KEYSERVER_URL="https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${KEY_FPR}"
+SF_RSS="https://sourceforge.net/projects/xanmod/rss?path=/releases/${XANMOD_BRANCH}&limit=500"
+UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+BBR_SYSCTL="/etc/sysctl.d/99-bbr.conf"
+
+WORK="$(mktemp -d /tmp/xanmod.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BLUE='\033[0;34m'; NC='\033[0m'
+info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 echo "============================================================"
 echo " XanMod Kernel Installer"
 echo "============================================================"
-echo
 
 # ------------------------------------------------------------
-# Root check
+# Checks
 # ------------------------------------------------------------
 
-if [[ "${EUID}" -ne 0 ]]; then
-    echo "ERROR: Run this script as root."
-    exit 1
-fi
+[[ "$EUID" -eq 0 ]] || die "Run as root."
+[[ "$(uname -m)" == "x86_64" ]] || die "XanMod is x86_64 only (this is $(uname -m))."
 
-# ------------------------------------------------------------
-# OS check
-# ------------------------------------------------------------
-
-if [[ ! -f /etc/os-release ]]; then
-    echo "ERROR: Cannot detect operating system."
-    exit 1
-fi
-
+# shellcheck disable=SC1091
 source /etc/os-release
+[[ "$ID" == "ubuntu" || "$ID" == "debian" ]] || die "Ubuntu/Debian only."
+CODENAME="${VERSION_CODENAME:-}"
+[[ -n "$CODENAME" ]] || die "Cannot detect codename."
 
-if [[ "${ID}" != "ubuntu" ]]; then
-    echo "ERROR: This installer currently supports Ubuntu only."
-    exit 1
-fi
+info "OS: ${PRETTY_NAME} (${CODENAME}), kernel: $(uname -r)"
 
-if [[ "${VERSION_ID}" != "24.04" ]]; then
-    echo "ERROR: This installer is intended for Ubuntu 24.04."
-    echo "Detected: Ubuntu ${VERSION_ID}"
-    exit 1
-fi
-
-CODENAME="${VERSION_CODENAME:-noble}"
-
-echo "Detected:"
-echo "  OS:       ${PRETTY_NAME}"
-echo "  Codename: ${CODENAME}"
-echo
+export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+apt-get install -y -q ca-certificates curl wget gnupg >/dev/null || die "Failed to install dependencies."
 
 # ------------------------------------------------------------
-# CPU compatibility
+# CPU level (локально, без dl.xanmod.org)
 # ------------------------------------------------------------
 
-echo "[1/6] Checking CPU compatibility..."
+FLAGS="$(grep -m1 '^flags' /proc/cpuinfo)"
+has() { [[ " $FLAGS " == *" $1 "* ]]; }
 
-CHECK_SCRIPT="/tmp/check_x86-64_psabi.sh"
-
-curl -fsSL \
-    https://dl.xanmod.org/check_x86-64_psabi.sh \
-    -o "${CHECK_SCRIPT}"
-
-chmod +x "${CHECK_SCRIPT}"
-
-CPU_LEVEL="$("${CHECK_SCRIPT}" 2>/dev/null || true)"
-
-echo
-echo "CPU compatibility result:"
-echo "${CPU_LEVEL}"
-echo
-
-# ------------------------------------------------------------
-# Determine x64 level
-# ------------------------------------------------------------
-
-if echo "${CPU_LEVEL}" | grep -qi "x86-64-v3"; then
-    XANMOD_PACKAGE="linux-xanmod-x64v3"
-    echo "Detected x86-64-v3 CPU."
-    echo "Installing: ${XANMOD_PACKAGE}"
-
-elif echo "${CPU_LEVEL}" | grep -qi "x86-64-v2"; then
-    XANMOD_PACKAGE="linux-xanmod-x64v2"
-    echo "Detected x86-64-v2 CPU."
-    echo "Installing: ${XANMOD_PACKAGE}"
-
+if has avx2 && has bmi1 && has bmi2 && has fma && has movbe && has f16c; then
+    LEVEL="x64v3"
+elif has sse4_2 && has popcnt && has ssse3 && has cx16; then
+    LEVEL="x64v2"
 else
-    echo "WARNING: Could not determine CPU level automatically."
-    echo
-    echo "Falling back to x64v2."
-    XANMOD_PACKAGE="linux-xanmod-x64v2"
+    LEVEL="x64v1"
 fi
-
-echo
-
-# ------------------------------------------------------------
-# Dependencies
-# ------------------------------------------------------------
-
-echo "[2/6] Installing dependencies..."
-
-apt-get update
-apt-get install -y \
-    ca-certificates \
-    curl \
-    wget \
-    gnupg \
-    lsb-release
+ok "CPU level: ${LEVEL}"
 
 # ------------------------------------------------------------
-# Repository
+# Helpers
 # ------------------------------------------------------------
 
-echo "[3/6] Configuring XanMod repository..."
+fetch() {   # url out
+    rm -f "$2"
+    wget -q -T 30 -t 2 -O "$2" "$1" 2>/dev/null && [[ -s "$2" ]] && return 0
+    curl -fsSL --retry 2 --connect-timeout 20 -A "$UA" -o "$2" "$1" 2>/dev/null && [[ -s "$2" ]] && return 0
+    rm -f "$2"
+    return 1
+}
 
-mkdir -p /etc/apt/keyrings
+repo_reachable() {
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 \
+        "http://deb.xanmod.org/dists/${CODENAME}/Release")"
+    [[ "$code" == "200" ]]
+}
 
-wget -qO- https://dl.xanmod.org/archive.key \
-    | gpg --dearmor \
-    > /etc/apt/keyrings/xanmod-archive-keyring.gpg
+clean_repo() {
+    rm -f "$LIST"
+    find /etc/apt/sources.list.d -maxdepth 1 -type f -name '*.list' \
+        -exec sed -i '/deb\.xanmod\.org/d' {} + 2>/dev/null || true
+}
 
-chmod 644 /etc/apt/keyrings/xanmod-archive-keyring.gpg
+finish() {
+    command -v update-grub >/dev/null 2>&1 && update-grub
 
-cat > /etc/apt/sources.list.d/xanmod-release.list << EOF
-deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${CODENAME} main
-EOF
+    printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$BBR_SYSCTL"
+    sysctl --system >/dev/null 2>&1 || true
 
-# Remove old/broken XanMod repositories if present
-find /etc/apt/sources.list.d -type f \
-    ! -name "xanmod-release.list" \
-    -exec grep -Il "deb.xanmod.org" {} \; 2>/dev/null \
-    | while read -r file; do
-        echo "Removing old XanMod repository: ${file}"
-        rm -f "${file}"
-      done
+    echo
+    echo "Installed XanMod packages:"
+    dpkg -l | awk '/^ii  linux-(image|headers)-.*xanmod/ { print "  " $2 "  " $3 }'
+
+    local kver
+    kver="$(dpkg -l | awk '/^ii  linux-image-.*xanmod/ { sub(/^linux-image-/, "", $2); print $2 }' | sort -V | tail -n1)"
+    echo
+    if [[ -n "$kver" && -f "/boot/vmlinuz-${kver}" && -f "/boot/initrd.img-${kver}" ]]; then
+        ok "Kernel and initrd present: /boot/vmlinuz-${kver}"
+    else
+        die "Kernel or initrd for '${kver}' not found in /boot — DO NOT reboot, check the output above."
+    fi
+
+    echo
+    echo "============================================================"
+    echo " DONE. Before reboot on AWS/Lightsail: take a SNAPSHOT."
+    echo " Then: reboot"
+    echo " After reboot: uname -r   (contains xanmod)"
+    echo "               sysctl net.ipv4.tcp_congestion_control   (bbr)"
+    echo "============================================================"
+}
 
 # ------------------------------------------------------------
-# Install
+# 1. Official repository
 # ------------------------------------------------------------
 
-echo "[4/6] Updating package lists..."
+install_from_repo() {
+    local pkg="linux-xanmod-${LEVEL}" raw="${WORK}/xanmod.key" fpr
+    [[ "$LEVEL" == "x64v1" ]] && pkg="linux-xanmod-lts-x64v1"
 
-apt-get update
+    info "Trying official repository deb.xanmod.org..."
 
-echo
-echo "[5/6] Installing ${XANMOD_PACKAGE}..."
+    install -d -m 0755 /etc/apt/keyrings
+    if ! fetch "$KEY_URL" "$raw"; then
+        warn "dl.xanmod.org blocked, taking key from keyserver.ubuntu.com"
+        fetch "$KEYSERVER_URL" "$raw" || return 1
+    fi
+    gpg --dearmor --yes -o "$KEYRING" "$raw" 2>/dev/null || cp -f "$raw" "$KEYRING"
+    chmod 0644 "$KEYRING"
 
-apt-get install -y "${XANMOD_PACKAGE}"
+    fpr="$(gpg --show-keys --with-colons "$KEYRING" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')"
+    [[ "$fpr" == "$KEY_FPR" ]] || { warn "Key fingerprint mismatch: ${fpr:-none}"; rm -f "$KEYRING"; return 1; }
+
+    clean_repo
+    echo "deb [signed-by=${KEYRING}] http://deb.xanmod.org ${CODENAME} main" > "$LIST"
+
+    if ! apt-get update -q; then
+        clean_repo; apt-get update -q >/dev/null 2>&1; return 1
+    fi
+    if ! apt-cache policy "$pkg" | grep -q 'Candidate: [0-9]'; then
+        warn "${pkg} not available for ${CODENAME}"
+        clean_repo; apt-get update -q >/dev/null 2>&1; return 1
+    fi
+
+    apt-get install -y -q "$pkg"
+}
 
 # ------------------------------------------------------------
-# GRUB
+# 2. SourceForge (.deb)
 # ------------------------------------------------------------
 
-echo
-echo "[6/6] Updating GRUB..."
+install_from_sourceforge() {
+    local rss="${WORK}/sf.rss" img_url hdr_url img_name
 
-update-grub
+    info "Downloading from SourceForge (branch: ${XANMOD_BRANCH}, level: ${LEVEL})..."
+
+    fetch "$SF_RSS" "$rss" || { warn "SourceForge is not reachable either."; return 1; }
+
+    # Последний linux-image нужного уровня (без -rt / -edge вариантов)
+    img_url="$(grep -oE "https://sourceforge\.net/projects/xanmod/files/releases/${XANMOD_BRANCH}/[^<\"]*/linux-image-[0-9.]+-${LEVEL}-xanmod[0-9]+_[^/<\"]*_amd64\.deb/download" "$rss" \
+        | sort -u \
+        | awk -F/ '{ print $(NF-1) "\t" $0 }' \
+        | sort -V -k1,1 | tail -n1 | cut -f2)"
+
+    [[ -n "$img_url" ]] || { warn "No ${LEVEL} linux-image found in SourceForge feed."; return 1; }
+
+    img_name="$(awk -F/ '{ print $(NF-1) }' <<<"$img_url")"
+    hdr_url="${img_url//\/linux-image-/\/linux-headers-}"
+
+    info "Image:   ${img_name}"
+    info "Headers: ${img_name/linux-image-/linux-headers-}"
+
+    fetch "$img_url" "${WORK}/image.deb"   || { warn "Failed to download image."; return 1; }
+    fetch "$hdr_url" "${WORK}/headers.deb" || { warn "Failed to download headers."; return 1; }
+
+    dpkg-deb -I "${WORK}/image.deb"   >/dev/null 2>&1 || { warn "image.deb is not a valid package."; return 1; }
+    dpkg-deb -I "${WORK}/headers.deb" >/dev/null 2>&1 || { warn "headers.deb is not a valid package."; return 1; }
+
+    dpkg -i "${WORK}/image.deb" "${WORK}/headers.deb" || apt-get -f install -y -q || return 1
+
+    warn "Installed without a repository: kernel updates will NOT arrive via apt. Re-run this script to update."
+    return 0
+}
 
 # ------------------------------------------------------------
-# Result
+# Run
 # ------------------------------------------------------------
 
-echo
-echo "============================================================"
-echo " XanMod installation completed"
-echo "============================================================"
-echo
-echo "Installed package:"
-dpkg -l | grep "${XANMOD_PACKAGE}" || true
+case "$XANMOD_SOURCE" in
+    repo)
+        install_from_repo || die "Repository install failed." ;;
+    sourceforge)
+        install_from_sourceforge || die "SourceForge install failed." ;;
+    *)
+        if repo_reachable && install_from_repo; then
+            ok "Installed from official repository."
+        else
+            warn "deb.xanmod.org is blocked for this IP (or install failed). Falling back to SourceForge."
+            install_from_sourceforge || die "SourceForge install failed. Download the .deb files on another machine and install with dpkg -i."
+            ok "Installed from SourceForge."
+        fi
+        ;;
+esac
 
-echo
-echo "Current kernel:"
-uname -r
-
-echo
-echo "Installed XanMod kernels:"
-dpkg -l | grep xanmod || true
-
-echo
-echo "IMPORTANT:"
-echo "Reboot the server to start using XanMod:"
-echo
-echo "    reboot"
-echo
-echo "After reboot verify with:"
-echo
-echo "    uname -r"
-echo
-echo "============================================================"
+finish
