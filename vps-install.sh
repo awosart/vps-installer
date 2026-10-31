@@ -14,9 +14,14 @@
 #
 # Env (for unattended mode):
 #   SSH_PUBLIC_KEY="ssh-ed25519 AAAA..."
+#   NEW_SSH_PORT=2222              new SSH port (when changing it)
+#   VPN_PORTS="443"                ports for clients (tcp, or 443/udp)
+#   NODE_PORT=3000                 Remnanode port for the panel
+#   PANEL_IP="1.2.3.4"             open NODE_PORT only for this IP
+#   NODE_SECRET_KEY="..."          SECRET_KEY from Remnawave panel
 # ============================================================
 
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 
 set -o pipefail
 
@@ -55,7 +60,7 @@ Usage: vps-install.sh [--lang ru|en] [-y|--yes] [-h|--help]
   --lang ru|en   interface language / язык интерфейса
   -y, --yes      accept defaults / ответы по умолчанию
 
-Env: SSH_PUBLIC_KEY
+Env: SSH_PUBLIC_KEY NEW_SSH_PORT VPN_PORTS NODE_PORT PANEL_IP NODE_SECRET_KEY
 EOF_USAGE
     exit 0
 }
@@ -259,6 +264,126 @@ ask_input() {
 
     read -r -p "$(echo -e "${CYAN}?${NC}") ${prompt}${default:+ [Enter = ${default}]}: " answer <"$TTY_IN"
     echo "${answer:-$default}"
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# Порт уже выбран в анкете под другую задачу (сравнение без /tcp, /udp).
+port_taken() {
+    local port="$1" p
+    shift
+    for p in "$@"; do
+        [[ "${p%/*}" == "$port" ]] && return 0
+    done
+    return 1
+}
+
+# ask_port "Вопрос" default [занятые порты...] -> печатает порт
+ask_port() {
+    local prompt="$1" default="$2" answer
+    shift 2
+    while true; do
+        answer="$(ask_input "$prompt" "$default")"
+        if ! valid_port "$answer"; then
+            warning "$(L "Нужен номер порта от 1 до 65535." "Enter a port number from 1 to 65535.")" >&2
+        elif port_taken "$((10#$answer))" "$@"; then
+            warning "$(L "Порт ${answer} уже занят в этой настройке." "Port ${answer} is already used in this setup.")" >&2
+        else
+            echo "$((10#$answer))"
+            return 0
+        fi
+        [[ "$ASSUME_YES" -eq 1 ]] && return 1
+    done
+}
+
+# ask_port_list "Вопрос" default [занятые порты...] -> "443 8443/udp"
+ask_port_list() {
+    local prompt="$1" default="$2" answer spec list bad
+    shift 2
+    while true; do
+        answer="$(ask_input "$prompt" "$default")"
+        list="" bad=""
+        for spec in ${answer//,/ }; do
+            spec="${spec,,}"
+            if [[ ! "$spec" =~ ^([0-9]+)(/(tcp|udp))?$ ]] || ! valid_port "${BASH_REMATCH[1]}" \
+                    || port_taken "${spec%/*}" "$@"; then
+                bad="$spec"
+                break
+            fi
+            list+="${list:+ }${spec}"
+        done
+        if [[ -z "$bad" ]]; then
+            echo "$list"
+            return 0
+        fi
+        warning "$(L "Неверный или уже занятый порт: ${bad}. Пример: 443 или 443, 8443/udp" \
+                     "Invalid or already used port: ${bad}. Example: 443 or 443, 8443/udp")" >&2
+        [[ "$ASSUME_YES" -eq 1 ]] && return 1
+    done
+}
+
+valid_ip() {
+    local ip="${1%/*}" o
+    if [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+        return 0
+    fi
+    [[ "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ]]
+}
+
+# Пустой ответ — порт ноды будет открыт для всех.
+ask_panel_ip() {
+    local answer
+    while true; do
+        answer="$(ask_input "$(L "IP панели Remnawave (порт ноды откроется только для него, Enter — для всех)" \
+                                 "Remnawave panel IP (node port will be open only to it, Enter — to everyone)")" "${PANEL_IP:-}")"
+        if [[ -z "$answer" ]] || valid_ip "$answer"; then
+            echo "$answer"
+            return 0
+        fi
+        warning "$(L "Это не IP-адрес: ${answer}" "Not an IP address: ${answer}")" >&2
+        [[ "$ASSUME_YES" -eq 1 ]] && return 1
+    done
+}
+
+# SECRET_KEY ноды из панели. Пустой ответ — скрипт ноды спросит его сам.
+collect_node_secret() {
+    local key line
+    [[ -n "${NODE_SECRET_KEY:-}" || "$ASSUME_YES" -eq 1 ]] && return 0
+
+    echo
+    echo -e "${BOLD}SECRET_KEY $(L "ноды" "of the node")${NC}"
+    L "  Скопируйте его в панели Remnawave при создании ноды. Вставьте и нажмите Enter." \
+      "  Copy it in the Remnawave panel when creating the node. Paste it and press Enter."; echo
+    L "  Пусто — скрипт ноды спросит ключ сам во время установки." \
+      "  Leave empty — the node script will ask for it during installation."; echo
+
+    while true; do
+        read -r -p "SECRET_KEY: " key <"$TTY_IN"
+        # Длинный ключ может прийти несколькими строками — склеиваем, как скрипт ноды.
+        while IFS= read -r -t 1 line <"$TTY_IN"; do
+            line="${line%$'\r'}"
+            [[ -z "$line" ]] && break
+            key+="$line"
+        done
+        flush_tty_input
+        key="${key//$'\r'/}"
+        key="$(printf '%s' "$key" | sed -E 's/^[[:space:]]*((SECRET_KEY|SSL_CERT)=)?["'\'']?//; s/["'\'']?[[:space:]]*$//')"
+
+        if [[ -z "$key" ]]; then
+            info "$(L "Ключ будет запрошен при установке ноды." "The key will be asked during node installation.")"
+            return 0
+        fi
+        if [[ "${#key}" -ge 20 && "$key" != *[[:space:]]* ]]; then
+            NODE_SECRET_KEY="$key"
+            success "$(L "SECRET_KEY принят (${#key} символов)." "SECRET_KEY accepted (${#key} characters).")"
+            return 0
+        fi
+        warning "$(L "Не похоже на SECRET_KEY: нужна одна длинная строка без пробелов." \
+                     "This does not look like a SECRET_KEY: expected one long line without spaces.")"
+    done
 }
 
 # ============================================================
@@ -506,12 +631,9 @@ normalize_pubkey() {
     return 1
 }
 
-add_root_ssh_key() {
-    local auth="/root/.ssh/authorized_keys" raw key
-
-    install -d -m 700 /root/.ssh
-    touch "$auth"
-    chmod 600 "$auth"
+# Спрашивает ключ в анкете и кладёт его в SSH_KEY_TO_ADD; записывает add_root_ssh_key.
+collect_ssh_key() {
+    local raw key
 
     while true; do
         if [[ -n "${SSH_PUBLIC_KEY:-}" ]]; then
@@ -571,15 +693,27 @@ add_root_ssh_key() {
             continue
         fi
 
-        if grep -Fq -- "$(awk '{print $2}' <<<"$key")" "$auth"; then
-            success "$(L "Этот ключ уже есть в ${auth}." "This key is already in ${auth}.")"
-        else
-            printf '%s\n' "$key" >> "$auth"
-            success "$(L "Ключ добавлен в ${auth}:" "Key added to ${auth}:")"
-        fi
+        success "$(L "Ключ принят, он будет добавлен при установке:" "Key accepted, it will be added during installation:")"
         ssh-keygen -l -f <(printf '%s\n' "$key") 2>/dev/null | sed 's/^/  /'
+        SSH_KEY_TO_ADD="$key"
         return 0
     done
+}
+
+add_root_ssh_key() {
+    local auth="/root/.ssh/authorized_keys" key="$SSH_KEY_TO_ADD"
+
+    install -d -m 700 /root/.ssh
+    touch "$auth"
+    chmod 600 "$auth"
+
+    if grep -Fq -- "$(awk '{print $2}' <<<"$key")" "$auth"; then
+        success "$(L "Этот ключ уже есть в ${auth}." "This key is already in ${auth}.")"
+    else
+        printf '%s\n' "$key" >> "$auth" || return 1
+        success "$(L "Ключ добавлен в ${auth}:" "Key added to ${auth}:")"
+    fi
+    ssh-keygen -l -f <(printf '%s\n' "$key") 2>/dev/null | sed 's/^/  /'
 }
 
 backup_ssh_config() {
@@ -769,7 +903,9 @@ EOF
 }
 
 # ============================================================
-# STEP: UFW (только установка; правила настраивает security.sh)
+# STEP: UFW
+# Ни security.sh, ни f2b.sh UFW не включают, поэтому правила
+# и включение — здесь, после смены SSH-порта и до установки ноды.
 # ============================================================
 
 ensure_ufw() {
@@ -779,6 +915,50 @@ ensure_ufw() {
     fi
     warning "$(L "UFW не установлен, устанавливаю..." "UFW is not installed, installing...")"
     apt_get install ufw
+}
+
+# "443" -> 443/tcp, "443/udp" -> 443/udp
+ufw_allow_spec() {
+    local spec="$1" note="$2"
+    [[ "$spec" == */* ]] || spec="${spec}/tcp"
+    ufw allow "$spec" comment "$note" >/dev/null || return 1
+    info "UFW: ${spec} — ${note}"
+}
+
+configure_ufw() {
+    local ssh_ports p
+    ssh_ports="$(get_ssh_ports)"
+
+    # Без SSH-порта в правилах включённый UFW отрежет доступ к серверу.
+    if [[ -z "${ssh_ports// /}" ]]; then
+        error "$(L "Не удалось определить SSH-порт — UFW не включаю, иначе доступ к серверу пропадёт." \
+                   "Could not detect the SSH port — UFW is not enabled, or you would lose access.")"
+        return 1
+    fi
+
+    ufw default deny incoming >/dev/null || return 1
+    ufw default allow outgoing >/dev/null || return 1
+
+    for p in $ssh_ports; do
+        ufw_allow_spec "$p" "ssh" || return 1
+    done
+    for p in $VPN_PORTS; do
+        ufw_allow_spec "$p" "vpn" || return 1
+    done
+
+    if [[ "$DO_REMNANODE" -eq 1 ]]; then
+        if [[ -n "$PANEL_IP" ]]; then
+            ufw allow proto tcp from "$PANEL_IP" to any port "$NODE_PORT" comment "remnanode" >/dev/null || return 1
+            info "UFW: ${NODE_PORT}/tcp — remnanode ($(L "только с" "only from") ${PANEL_IP})"
+        else
+            ufw_allow_spec "$NODE_PORT" "remnanode" || return 1
+            warning "$(L "Порт ноды ${NODE_PORT} открыт для всех. Лучше разрешить его только IP панели." \
+                         "Node port ${NODE_PORT} is open to everyone. Better allow it only for the panel IP.")"
+        fi
+    fi
+
+    ufw --force enable || return 1
+    ufw status verbose
 }
 
 # Проверка, что Fail2Ban следит за актуальным SSH-портом.
@@ -826,17 +1006,20 @@ remnanode_running() {
 }
 
 install_remnanode() {
-    local rc
-    section "08-remnanode"
-    log "bash <(curl -fsSL ${REMNANODE_URL}) @ install"
+    local rc node_args=(--port "$NODE_PORT")
+    section "09-remnanode"
+    log "bash <(curl -fsSL ${REMNANODE_URL}) @ install --port ${NODE_PORT}${NODE_SECRET_KEY:+ --secret-key ***}"
     echo
+
+    # Без --force: он молча перезаписал бы уже установленную ноду.
+    [[ -n "$NODE_SECRET_KEY" ]] && node_args+=(--secret-key "$NODE_SECRET_KEY")
     warning "$(L "После установки скрипт ноды сам откроет логи контейнера. Когда увидите, что нода запустилась, нажмите Ctrl+C — установка продолжится." \
                  "After installation the node script opens container logs. Once the node is up, press Ctrl+C — the installer will continue.")"
     echo
 
     # Ctrl+C должен закрыть только логи ноды, а не весь установщик.
     trap ':' INT
-    bash <(curl -fsSL "$REMNANODE_URL") @ install <"$TTY_IN" >&3 2>&4
+    bash <(curl -fsSL "$REMNANODE_URL") @ install "${node_args[@]}" <"$TTY_IN" >&3 2>&4
     rc=$?
     trap - INT
 
@@ -846,10 +1029,10 @@ install_remnanode() {
     if remnanode_running; then
         [[ "$rc" -ne 0 ]] && info "$(L "Скрипт ноды завершился с кодом ${rc} (выход из логов), но контейнер работает." \
                                         "Node script exited with code ${rc} (logs closed), but the container is running.")"
-        mark_result "08-remnanode" 0
+        mark_result "09-remnanode" 0
     else
         error "$(L "Контейнер remnanode не запущен." "The remnanode container is not running.")"
-        mark_result "08-remnanode" "$(( rc == 0 ? 1 : rc ))"
+        mark_result "09-remnanode" "$(( rc == 0 ? 1 : rc ))"
     fi
 }
 
@@ -875,6 +1058,14 @@ log "SSH ports:    ${CURRENT_SSH_PORTS}"
 
 section "$(L "НАСТРОЙКА — ответьте на вопросы, дальше установка пойдёт сама" \
              "SETUP — answer the questions, installation then runs on its own")"
+
+# Все ответы собираются здесь, до установки; значения по умолчанию можно задать через env.
+SSH_KEY_TO_ADD=""
+NEW_SSH_PORT="${NEW_SSH_PORT:-}"
+VPN_PORTS="${VPN_PORTS:-443}"
+NODE_PORT="${NODE_PORT:-3000}"
+PANEL_IP="${PANEL_IP:-}"
+NODE_SECRET_KEY="${NODE_SECRET_KEY:-}"
 
 # ---------------- SSH ----------------
 
@@ -908,6 +1099,11 @@ SSH_CHOICE="$(ask_choice \
 
 [[ "$SSH_CHOICE" == "2" ]] && DO_SSH_KEY=1 || DO_SSH_KEY=0
 
+if [[ "$DO_SSH_KEY" -eq 1 ]] && ! collect_ssh_key; then
+    warning "$(L "Ключ не получен — шаг добавления ключа пропущен." "No key received — the add-key step is skipped.")"
+    DO_SSH_KEY=0
+fi
+
 # ---------------- SSH port ----------------
 
 echo
@@ -917,9 +1113,20 @@ if [[ "$CLOUD" == "aws" ]]; then
 fi
 DEF_SSH_PORT="y"
 [[ "$CLOUD" == "aws" || "$DO_SSH_KEY" -eq 0 ]] && DEF_SSH_PORT="n"
+[[ -n "$NEW_SSH_PORT" ]] && DEF_SSH_PORT="y"
 ask_yn "$(L "Сменить SSH-порт (сейчас: ${CURRENT_SSH_PORTS:-22})?" \
             "Change SSH port (current: ${CURRENT_SSH_PORTS:-22})?")" "$DEF_SSH_PORT" \
-    && DO_SSH_PORT=1 || DO_SSH_PORT=0
+    && DO_SSH_PORT=1 || { DO_SSH_PORT=0; NEW_SSH_PORT=""; }
+
+if [[ "$DO_SSH_PORT" -eq 1 ]]; then
+    # shellcheck disable=SC2086
+    if ! NEW_SSH_PORT="$(ask_port "$(L "Новый SSH-порт" "New SSH port")" "$NEW_SSH_PORT" $CURRENT_SSH_PORTS)"; then
+        warning "$(L "Новый порт не задан (NEW_SSH_PORT) — SSH-порт не меняю." \
+                     "No new port given (NEW_SSH_PORT) — SSH port is not changed.")"
+        DO_SSH_PORT=0
+        NEW_SSH_PORT=""
+    fi
+fi
 
 # ---------------- Kernel / BBR ----------------
 
@@ -943,8 +1150,8 @@ fi
 
 # ---------------- Other steps ----------------
 
-ask_yn "$(L "Усилить защиту SSH и настроить UFW (security.sh: вход только по ключу, файрвол)?" \
-            "Harden SSH and configure UFW (security.sh: key-only login, firewall)?")" "y" \
+ask_yn "$(L "Усилить защиту SSH (security.sh: вход только по ключу)?" \
+            "Harden SSH (security.sh: key-only login)?")" "y" \
     && DO_SECURITY=1 || DO_SECURITY=0
 
 ask_yn "$(L "Установить Fail2Ban (блокировка перебора паролей)?" \
@@ -965,22 +1172,62 @@ fi
 ask_yn "$(L "Настроить swap-файл (${SWAP_NOTE})?" "Configure swap file (${SWAP_NOTE})?")" "$DEF_SWAP" \
     && DO_SWAP=1 || DO_SWAP=0
 
+# ---------------- Remnanode ----------------
+
 ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")" "y" \
     && DO_REMNANODE=1 || DO_REMNANODE=0
+
+if [[ "$DO_REMNANODE" -eq 1 ]]; then
+    # shellcheck disable=SC2086
+    NODE_PORT="$(ask_port "$(L "Порт ноды (для связи с панелью)" "Node port (for the panel connection)")" \
+                          "$NODE_PORT" $CURRENT_SSH_PORTS $NEW_SSH_PORT)" \
+        || { error "$(L "Неверный NODE_PORT." "Invalid NODE_PORT.")"; exit 1; }
+    PANEL_IP="$(ask_panel_ip)" || { error "$(L "Неверный PANEL_IP." "Invalid PANEL_IP.")"; exit 1; }
+    collect_node_secret
+fi
+
+# ---------------- Firewall ----------------
+
+echo
+ask_yn "$(L "Включить файрвол UFW (закрыть всё, кроме SSH, портов VPN и порта ноды)?" \
+            "Enable UFW firewall (block everything except SSH, VPN ports and node port)?")" "y" \
+    && DO_UFW=1 || DO_UFW=0
+
+if [[ "$DO_UFW" -eq 1 ]]; then
+    NODE_PORT_TAKEN=""
+    [[ "$DO_REMNANODE" -eq 1 ]] && NODE_PORT_TAKEN="$NODE_PORT"
+    # shellcheck disable=SC2086
+    VPN_PORTS="$(ask_port_list "$(L "Порты VPN для клиентов (через пробел или запятую, 443/udp — для UDP)" \
+                                    "VPN ports for clients (space or comma separated, 443/udp for UDP)")" \
+                               "$VPN_PORTS" $CURRENT_SSH_PORTS $NEW_SSH_PORT $NODE_PORT_TAKEN)" \
+        || { error "$(L "Неверный VPN_PORTS." "Invalid VPN_PORTS.")"; exit 1; }
+    if [[ "$CLOUD" == "aws" ]]; then
+        warning "$(L "AWS: эти порты нужно открыть и в Security Group." \
+                     "AWS: these ports must also be opened in the Security Group.")"
+    fi
+fi
 
 # ---------------- Confirm ----------------
 
 yn_word() { [[ "$1" -eq 1 ]] && L "да" "yes" || L "нет" "no"; }
 
+UFW_PLAN=""
+if [[ "$DO_UFW" -eq 1 ]]; then
+    UFW_PLAN="  (SSH ${NEW_SSH_PORT:-${CURRENT_SSH_PORTS% }}; VPN ${VPN_PORTS:--}"
+    [[ "$DO_REMNANODE" -eq 1 ]] && UFW_PLAN+="; $(L "нода" "node") ${NODE_PORT} $(L "для" "for") ${PANEL_IP:-$(L "всех" "all")}"
+    UFW_PLAN+=")"
+fi
+
 section "$(L "ПЛАН УСТАНОВКИ" "INSTALLATION PLAN")"
 echo "  01 $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
 echo "  02 XanMod + BBRv3            : $(yn_word "$DO_XANMOD")$([[ "$DO_BBR_SCRIPT" -eq 1 ]] && echo "  (bbrv3.sh opiran)")"
-echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")"
-echo "  04 $(L "Защита SSH + UFW (security.sh)" "SSH hardening + UFW (security.sh)"): $(yn_word "$DO_SECURITY")"
-echo "  05 Fail2Ban                  : $(yn_word "$DO_F2B")"
-echo "  06 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
-echo "  07 Swap                      : $(yn_word "$DO_SWAP")"
-echo "  08 Remnanode                 : $(yn_word "$DO_REMNANODE")"
+echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")${NEW_SSH_PORT:+  (${CURRENT_SSH_PORTS% } -> ${NEW_SSH_PORT})}"
+echo "  04 $(L "Защита SSH (security.sh) " "SSH hardening (security.sh)"): $(yn_word "$DO_SECURITY")"
+echo "  05 $(L "Файрвол UFW              " "UFW firewall             "): $(yn_word "$DO_UFW")${UFW_PLAN}"
+echo "  06 Fail2Ban                  : $(yn_word "$DO_F2B")"
+echo "  07 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
+echo "  08 Swap                      : $(yn_word "$DO_SWAP")"
+echo "  09 Remnanode                 : $(yn_word "$DO_REMNANODE")$([[ "$DO_REMNANODE" -eq 1 ]] && echo "  (NODE_PORT ${NODE_PORT}, SECRET_KEY: $([[ -n "$NODE_SECRET_KEY" ]] && L "есть" "set" || L "спросит при установке" "asked during install"))")"
 echo
 
 if ! ask_yn "$(L "Начать установку?" "Start installation?")" "y"; then
@@ -1011,8 +1258,6 @@ apt_get upgrade || { warning "apt-get upgrade failed."; INSTALL_FAILED=1; }
 
 ensure_ssh_server || { error "openssh-server install failed."; INSTALL_FAILED=1; }
 
-run_local "00-ufw-install" ensure_ufw
-
 # ============================================================
 # 01 - SSH KEY
 # ============================================================
@@ -1040,13 +1285,15 @@ if [[ "$DO_BBR_SCRIPT" -eq 1 ]]; then
 fi
 
 # ============================================================
-# 03 - SSH PORT -> 04 - SECURITY (UFW) -> 05 - FAIL2BAN
-# Сначала ваш SSH-порт, затем security.sh настраивает UFW,
-# затем Fail2Ban ставится на рабочий порт и проверяется.
+# 03 - SSH PORT -> 04 - SECURITY -> 05 - UFW -> 06 - FAIL2BAN
+# Сначала ваш SSH-порт, затем UFW открывает фактический SSH-порт,
+# порты VPN и ноды, затем Fail2Ban ставится на рабочий порт.
+# Нода ставится последней — её порт к этому моменту уже открыт.
 # ============================================================
 
 if [[ "$DO_SSH_PORT" -eq 1 ]]; then
-    run_remote "03-ssh-port" "${DIGNEZZZ_BASE}/ssh-port.sh"
+    # Без --remove-old-port: старый порт остаётся в файрволе, пока новый не проверен.
+    run_remote "03-ssh-port" "${DIGNEZZZ_BASE}/ssh-port.sh" --port "$NEW_SSH_PORT" --yes
     info "$(L "SSH-порт(ы) после смены" "SSH port(s) after change"): $(get_ssh_ports)"
 else
     skip_step "03-ssh-port"
@@ -1065,29 +1312,40 @@ else
     skip_step "04-security"
 fi
 
+if [[ "$DO_UFW" -eq 1 ]]; then
+    run_local "05a-ufw-install" ensure_ufw
+    if command -v ufw >/dev/null 2>&1; then
+        run_local "05-ufw" configure_ufw
+    else
+        skip_step "05-ufw"
+    fi
+else
+    skip_step "05-ufw"
+fi
+
 if [[ "$DO_F2B" -eq 1 ]]; then
-    run_remote "05-f2b" "${DIGNEZZZ_BASE}/f2b.sh"
-    section "05b-f2b-check"
+    run_remote "06-f2b" "${DIGNEZZZ_BASE}/f2b.sh"
+    section "06b-f2b-check"
     check_f2b_ssh_port || INSTALL_FAILED=1
 else
-    skip_step "05-f2b"
+    skip_step "06-f2b"
 fi
 
 # ============================================================
-# 06 - DASHBOARD, 07 - SWAP
+# 07 - DASHBOARD, 08 - SWAP
 # ============================================================
 
-run_optional "$DO_DASHBOARD" "06-dashboard" "${DIGNEZZZ_BASE}/dashboard.sh"
-run_optional "$DO_SWAP"      "07-swap"      "${DIGNEZZZ_BASE}/swap.sh"
+run_optional "$DO_DASHBOARD" "07-dashboard" "${DIGNEZZZ_BASE}/dashboard.sh"
+run_optional "$DO_SWAP"      "08-swap"      "${DIGNEZZZ_BASE}/swap.sh"
 
 # ============================================================
-# 08 - REMNANODE
+# 09 - REMNANODE
 # ============================================================
 
 if [[ "$DO_REMNANODE" -eq 1 ]]; then
     install_remnanode
 else
-    skip_step "08-remnanode"
+    skip_step "09-remnanode"
 fi
 
 # ============================================================
@@ -1135,6 +1393,9 @@ echo "SSH keys in  : $(find_ssh_key_files | tr '\n' ' ')"
 echo "Fail2Ban     : $(get_service_status fail2ban)"
 echo "Docker       : $(get_service_status docker)"
 echo "UFW          : $(ufw status 2>/dev/null | head -n1)"
+if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw status 2>/dev/null | awk '/ALLOW|DENY|LIMIT/ { print "  " $0 }'
+fi
 
 echo
 echo "Swap:"
