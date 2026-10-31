@@ -946,7 +946,7 @@ configure_ufw() {
         ufw_allow_spec "$p" "vpn" || return 1
     done
 
-    if [[ "$DO_REMNANODE" -eq 1 ]]; then
+    if [[ "$NODE_IN_UFW" -eq 1 ]]; then
         if [[ -n "$PANEL_IP" ]]; then
             ufw allow proto tcp from "$PANEL_IP" to any port "$NODE_PORT" comment "remnanode" >/dev/null || return 1
             info "UFW: ${NODE_PORT}/tcp — remnanode ($(L "только с" "only from") ${PANEL_IP})"
@@ -1037,6 +1037,104 @@ install_remnanode() {
 }
 
 # ============================================================
+# STATE (повторный запуск: что уже сделано)
+# ============================================================
+
+REMNANODE_ENV="/opt/remnanode/.env"
+
+sshd_option() {
+    local sshd_bin
+    sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
+    "$sshd_bin" -T 2>/dev/null | awk -v k="$1" '$1 == k { print $2; exit }'
+}
+
+# ST_* — пояснение, если шаг уже сделан; пусто — ещё нет.
+detect_state() {
+    ST_XANMOD="" ST_BBR="" ST_SSH_PORT="" ST_SECURITY="" ST_UFW=""
+    ST_F2B="" ST_DASHBOARD="" ST_SWAP="" ST_REMNANODE=""
+
+    if [[ "$(uname -r)" == *xanmod* ]]; then
+        ST_XANMOD="$(L "работает" "running") ($(uname -r))"
+    elif dpkg -l 2>/dev/null | grep -q '^ii  linux-image-.*xanmod'; then
+        ST_XANMOD="$(L "установлено, нужна перезагрузка" "installed, reboot required")"
+    fi
+    [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == bbr* ]] \
+        && ST_BBR="$(L "включён" "enabled")"
+    if [[ -n "${CURRENT_SSH_PORTS// /}" ]] && ! grep -qw 22 <<<"$CURRENT_SSH_PORTS"; then
+        ST_SSH_PORT="$(L "порт" "port") ${CURRENT_SSH_PORTS% }"
+    fi
+    [[ "$(sshd_option passwordauthentication)" == "no" ]] \
+        && ST_SECURITY="$(L "вход по паролю выключен" "password login disabled")"
+    ufw status 2>/dev/null | grep -q '^Status: active' \
+        && ST_UFW="$(L "включён" "active")"
+    systemctl is-active --quiet fail2ban 2>/dev/null \
+        && ST_F2B="$(L "работает" "running")"
+    [[ -f /etc/update-motd.d/99-dashboard || -f /etc/profile.d/motd.sh ]] \
+        && ST_DASHBOARD="$(L "установлен" "installed")"
+    swapon --show --noheadings 2>/dev/null | grep -q . \
+        && ST_SWAP="$(free -h 2>/dev/null | awk '/^Swap:/ { print $2 }')"
+    if remnanode_running; then
+        ST_REMNANODE="$(L "работает" "running")"
+    elif [[ -f "$REMNANODE_ENV" ]]; then
+        ST_REMNANODE="$(L "установлена, но не запущена" "installed, not running")"
+    fi
+}
+
+# Ответы прошлого запуска: порт ноды из её .env, порты VPN и IP панели
+# из правил UFW с комментариями vpn / remnanode (их ставит шаг 05-ufw).
+load_previous_answers() {
+    local v
+    PREV_NODE_PORT="" PREV_VPN_PORTS="" PREV_PANEL_IP=""
+
+    if [[ -f "$REMNANODE_ENV" ]]; then
+        v="$(awk -F= '$1 == "NODE_PORT" { gsub(/["\r ]/, "", $2); print $2; exit }' "$REMNANODE_ENV")"
+        valid_port "$v" && PREV_NODE_PORT="$v"
+    fi
+    if command -v ufw >/dev/null 2>&1; then
+        PREV_VPN_PORTS="$(ufw status 2>/dev/null \
+            | awk '/# vpn$/ && !/\(v6\)/ { sub(/\/tcp$/, "", $1); print $1 }' | sort -u | tr '\n' ' ')"
+        PREV_VPN_PORTS="${PREV_VPN_PORTS% }"
+        v="$(ufw status 2>/dev/null | awk '/# remnanode$/ && !/\(v6\)/ && $3 != "Anywhere" { print $3; exit }')"
+        valid_ip "$v" && PREV_PANEL_IP="$v"
+    fi
+}
+
+show_state() {
+    local found=0 row label value
+    section "$(L "СОСТОЯНИЕ СЕРВЕРА" "SERVER STATE")"
+    for row in \
+        "XanMod|$ST_XANMOD" "BBR|$ST_BBR" "$(L "SSH-порт" "SSH port")|$ST_SSH_PORT" \
+        "$(L "Защита SSH" "SSH hardening")|$ST_SECURITY" "UFW|$ST_UFW" "Fail2Ban|$ST_F2B" \
+        "$(L "Дашборд" "Dashboard")|$ST_DASHBOARD" "Swap|$ST_SWAP" "Remnanode|$ST_REMNANODE"; do
+        label="${row%%|*}" value="${row#*|}"
+        [[ -n "$value" ]] || continue
+        echo -e "  ${GREEN}✓${NC} ${label}: ${value}"
+        found=1
+    done
+    if [[ "$found" -eq 0 ]]; then
+        L "  Чистый сервер: ни один шаг ещё не выполнен." "  Clean server: no step has been done yet."; echo
+    else
+        echo
+        L "  Для сделанных шагов ответ по умолчанию — «нет»." "  Steps already done default to \"no\"."; echo
+    fi
+}
+
+# " [уже: работает]" — подсказка в вопросе
+done_hint() {
+    [[ -n "$1" ]] && printf ' [%s: %s]' "$(L "уже" "already")" "$1"
+}
+
+# По умолчанию "y", если шаг ещё не сделан.
+def_if_not_done() {
+    [[ -n "$1" ]] && echo "n" || echo "y"
+}
+
+# Хвост строки плана для пропускаемого, но уже сделанного шага.
+plan_done() {
+    [[ "$1" -eq 0 && -n "$2" ]] && printf '  (%s %s)' "$(L "уже:" "already:")" "$2"
+}
+
+# ============================================================
 # START
 # ============================================================
 
@@ -1044,6 +1142,7 @@ section "VPS INSTALLER v${SCRIPT_VERSION}"
 
 CLOUD="$(detect_cloud)"
 CURRENT_SSH_PORTS="$(get_ssh_ports)"
+CURRENT_SSH_PORTS="${CURRENT_SSH_PORTS% }"
 
 log "OS:           ${PRETTY_NAME}"
 log "Kernel:       $(uname -r)"
@@ -1052,6 +1151,10 @@ log "Hostname:     $(hostname)"
 log "Cloud:        ${CLOUD}"
 log "SSH ports:    ${CURRENT_SSH_PORTS}"
 
+detect_state
+load_previous_answers
+show_state
+
 # ============================================================
 # QUESTIONNAIRE
 # ============================================================
@@ -1059,12 +1162,13 @@ log "SSH ports:    ${CURRENT_SSH_PORTS}"
 section "$(L "НАСТРОЙКА — ответьте на вопросы, дальше установка пойдёт сама" \
              "SETUP — answer the questions, installation then runs on its own")"
 
-# Все ответы собираются здесь, до установки; значения по умолчанию можно задать через env.
+# Все ответы собираются здесь, до установки.
+# Значения по умолчанию: env, затем прошлый запуск, затем встроенные.
 SSH_KEY_TO_ADD=""
 NEW_SSH_PORT="${NEW_SSH_PORT:-}"
-VPN_PORTS="${VPN_PORTS:-443}"
-NODE_PORT="${NODE_PORT:-3000}"
-PANEL_IP="${PANEL_IP:-}"
+VPN_PORTS="${VPN_PORTS:-${PREV_VPN_PORTS:-443}}"
+NODE_PORT="${NODE_PORT:-${PREV_NODE_PORT:-3000}}"
+PANEL_IP="${PANEL_IP:-$PREV_PANEL_IP}"
 NODE_SECRET_KEY="${NODE_SECRET_KEY:-}"
 
 # ---------------- SSH ----------------
@@ -1112,10 +1216,10 @@ if [[ "$CLOUD" == "aws" ]]; then
                  "AWS: a new SSH port must be opened manually in the Security Group, or you will lose access.")"
 fi
 DEF_SSH_PORT="y"
-[[ "$CLOUD" == "aws" || "$DO_SSH_KEY" -eq 0 ]] && DEF_SSH_PORT="n"
+[[ "$CLOUD" == "aws" || "$DO_SSH_KEY" -eq 0 || -n "$ST_SSH_PORT" ]] && DEF_SSH_PORT="n"
 [[ -n "$NEW_SSH_PORT" ]] && DEF_SSH_PORT="y"
 ask_yn "$(L "Сменить SSH-порт (сейчас: ${CURRENT_SSH_PORTS:-22})?" \
-            "Change SSH port (current: ${CURRENT_SSH_PORTS:-22})?")" "$DEF_SSH_PORT" \
+            "Change SSH port (current: ${CURRENT_SSH_PORTS:-22})?")$(done_hint "$ST_SSH_PORT")" "$DEF_SSH_PORT" \
     && DO_SSH_PORT=1 || { DO_SSH_PORT=0; NEW_SSH_PORT=""; }
 
 if [[ "$DO_SSH_PORT" -eq 1 ]]; then
@@ -1132,7 +1236,8 @@ fi
 
 if [[ "$(uname -m)" == "x86_64" ]]; then
     ask_yn "$(L "Установить ядро XanMod с BBRv3 (ускорение сети, нужна перезагрузка)?" \
-                "Install XanMod kernel with BBRv3 (faster networking, reboot required)?")" "y" \
+                "Install XanMod kernel with BBRv3 (faster networking, reboot required)?")$(done_hint "$ST_XANMOD")" \
+           "$(def_if_not_done "$ST_XANMOD")" \
         && DO_XANMOD=1 || DO_XANMOD=0
 else
     info "$(L "Архитектура $(uname -m): XanMod недоступен, шаг пропущен." \
@@ -1140,42 +1245,44 @@ else
     DO_XANMOD=0
 fi
 
-if [[ "$DO_XANMOD" -eq 1 ]]; then
+if [[ "$DO_XANMOD" -eq 1 || -n "$ST_XANMOD" ]]; then
     DO_BBR_SCRIPT=0
 else
     ask_yn "$(L "Включить BBRv3 сторонним скриптом (opiran bbrv3.sh)?" \
-                "Enable BBRv3 with third-party script (opiran bbrv3.sh)?")" "y" \
+                "Enable BBRv3 with third-party script (opiran bbrv3.sh)?")$(done_hint "$ST_BBR")" \
+           "$(def_if_not_done "$ST_BBR")" \
         && DO_BBR_SCRIPT=1 || DO_BBR_SCRIPT=0
 fi
 
 # ---------------- Other steps ----------------
 
 ask_yn "$(L "Усилить защиту SSH (security.sh: вход только по ключу)?" \
-            "Harden SSH (security.sh: key-only login)?")" "y" \
+            "Harden SSH (security.sh: key-only login)?")$(done_hint "$ST_SECURITY")" \
+       "$(def_if_not_done "$ST_SECURITY")" \
     && DO_SECURITY=1 || DO_SECURITY=0
 
 ask_yn "$(L "Установить Fail2Ban (блокировка перебора паролей)?" \
-            "Install Fail2Ban (blocks brute-force attempts)?")" "y" \
+            "Install Fail2Ban (blocks brute-force attempts)?")$(done_hint "$ST_F2B")" \
+       "$(def_if_not_done "$ST_F2B")" \
     && DO_F2B=1 || DO_F2B=0
 
 ask_yn "$(L "Установить приветственный дашборд (информация о сервере при входе)?" \
-            "Install login dashboard (server info shown on login)?")" "y" \
+            "Install login dashboard (server info shown on login)?")$(done_hint "$ST_DASHBOARD")" \
+       "$(def_if_not_done "$ST_DASHBOARD")" \
     && DO_DASHBOARD=1 || DO_DASHBOARD=0
 
-if swapon --show --noheadings 2>/dev/null | grep -q .; then
-    DEF_SWAP="n"
-    SWAP_NOTE="$(L "swap уже есть" "swap already exists")"
-else
-    DEF_SWAP="y"
-    SWAP_NOTE="$(L "swap сейчас нет" "no swap right now")"
-fi
-ask_yn "$(L "Настроить swap-файл (${SWAP_NOTE})?" "Configure swap file (${SWAP_NOTE})?")" "$DEF_SWAP" \
+ask_yn "$(L "Настроить swap-файл?" "Configure swap file?")$(done_hint "$ST_SWAP")" \
+       "$(def_if_not_done "$ST_SWAP")" \
     && DO_SWAP=1 || DO_SWAP=0
 
 # ---------------- Remnanode ----------------
 
-ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")" "y" \
+ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")$(done_hint "$ST_REMNANODE")" \
+       "$(def_if_not_done "$ST_REMNANODE")" \
     && DO_REMNANODE=1 || DO_REMNANODE=0
+
+# Порт ноды нужен в UFW и когда нода уже стоит, иначе файрвол отрежет её от панели.
+[[ "$DO_REMNANODE" -eq 1 || -n "$ST_REMNANODE" ]] && NODE_IN_UFW=1 || NODE_IN_UFW=0
 
 if [[ "$DO_REMNANODE" -eq 1 ]]; then
     # shellcheck disable=SC2086
@@ -1189,13 +1296,23 @@ fi
 # ---------------- Firewall ----------------
 
 echo
+# UFW по умолчанию "да" и на повторном запуске: правила добавляются, дубли ufw пропускает.
 ask_yn "$(L "Включить файрвол UFW (закрыть всё, кроме SSH, портов VPN и порта ноды)?" \
-            "Enable UFW firewall (block everything except SSH, VPN ports and node port)?")" "y" \
+            "Enable UFW firewall (block everything except SSH, VPN ports and node port)?")$(done_hint "$ST_UFW")" "y" \
     && DO_UFW=1 || DO_UFW=0
 
 if [[ "$DO_UFW" -eq 1 ]]; then
+    if [[ "$DO_REMNANODE" -eq 0 && "$NODE_IN_UFW" -eq 1 ]]; then
+        info "$(L "Нода уже стоит — её порт тоже будет открыт в UFW." \
+                  "The node is already installed — its port will be opened in UFW too.")"
+        # shellcheck disable=SC2086
+        NODE_PORT="$(ask_port "$(L "Порт ноды (для связи с панелью)" "Node port (for the panel connection)")" \
+                              "$NODE_PORT" $CURRENT_SSH_PORTS $NEW_SSH_PORT)" \
+            || { error "$(L "Неверный NODE_PORT." "Invalid NODE_PORT.")"; exit 1; }
+        PANEL_IP="$(ask_panel_ip)" || { error "$(L "Неверный PANEL_IP." "Invalid PANEL_IP.")"; exit 1; }
+    fi
     NODE_PORT_TAKEN=""
-    [[ "$DO_REMNANODE" -eq 1 ]] && NODE_PORT_TAKEN="$NODE_PORT"
+    [[ "$NODE_IN_UFW" -eq 1 ]] && NODE_PORT_TAKEN="$NODE_PORT"
     # shellcheck disable=SC2086
     VPN_PORTS="$(ask_port_list "$(L "Порты VPN для клиентов (через пробел или запятую, 443/udp — для UDP)" \
                                     "VPN ports for clients (space or comma separated, 443/udp for UDP)")" \
@@ -1214,20 +1331,20 @@ yn_word() { [[ "$1" -eq 1 ]] && L "да" "yes" || L "нет" "no"; }
 UFW_PLAN=""
 if [[ "$DO_UFW" -eq 1 ]]; then
     UFW_PLAN="  (SSH ${NEW_SSH_PORT:-${CURRENT_SSH_PORTS% }}; VPN ${VPN_PORTS:--}"
-    [[ "$DO_REMNANODE" -eq 1 ]] && UFW_PLAN+="; $(L "нода" "node") ${NODE_PORT} $(L "для" "for") ${PANEL_IP:-$(L "всех" "all")}"
+    [[ "$NODE_IN_UFW" -eq 1 ]] && UFW_PLAN+="; $(L "нода" "node") ${NODE_PORT} $(L "для" "for") ${PANEL_IP:-$(L "всех" "all")}"
     UFW_PLAN+=")"
 fi
 
 section "$(L "ПЛАН УСТАНОВКИ" "INSTALLATION PLAN")"
 echo "  01 $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
-echo "  02 XanMod + BBRv3            : $(yn_word "$DO_XANMOD")$([[ "$DO_BBR_SCRIPT" -eq 1 ]] && echo "  (bbrv3.sh opiran)")"
-echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")${NEW_SSH_PORT:+  (${CURRENT_SSH_PORTS% } -> ${NEW_SSH_PORT})}"
-echo "  04 $(L "Защита SSH (security.sh) " "SSH hardening (security.sh)"): $(yn_word "$DO_SECURITY")"
-echo "  05 $(L "Файрвол UFW              " "UFW firewall             "): $(yn_word "$DO_UFW")${UFW_PLAN}"
-echo "  06 Fail2Ban                  : $(yn_word "$DO_F2B")"
-echo "  07 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")"
-echo "  08 Swap                      : $(yn_word "$DO_SWAP")"
-echo "  09 Remnanode                 : $(yn_word "$DO_REMNANODE")$([[ "$DO_REMNANODE" -eq 1 ]] && echo "  (NODE_PORT ${NODE_PORT}, SECRET_KEY: $([[ -n "$NODE_SECRET_KEY" ]] && L "есть" "set" || L "спросит при установке" "asked during install"))")"
+echo "  02 XanMod + BBRv3            : $(yn_word "$DO_XANMOD")$([[ "$DO_BBR_SCRIPT" -eq 1 ]] && echo "  (bbrv3.sh opiran)")$(plan_done "$DO_XANMOD" "$ST_XANMOD")"
+echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")${NEW_SSH_PORT:+  (${CURRENT_SSH_PORTS% } -> ${NEW_SSH_PORT})}$(plan_done "$DO_SSH_PORT" "$ST_SSH_PORT")"
+echo "  04 $(L "Защита SSH (security.sh) " "SSH hardening (security.sh)"): $(yn_word "$DO_SECURITY")$(plan_done "$DO_SECURITY" "$ST_SECURITY")"
+echo "  05 $(L "Файрвол UFW              " "UFW firewall             "): $(yn_word "$DO_UFW")${UFW_PLAN}$(plan_done "$DO_UFW" "$ST_UFW")"
+echo "  06 Fail2Ban                  : $(yn_word "$DO_F2B")$(plan_done "$DO_F2B" "$ST_F2B")"
+echo "  07 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")$(plan_done "$DO_DASHBOARD" "$ST_DASHBOARD")"
+echo "  08 Swap                      : $(yn_word "$DO_SWAP")$(plan_done "$DO_SWAP" "$ST_SWAP")"
+echo "  09 Remnanode                 : $(yn_word "$DO_REMNANODE")$([[ "$DO_REMNANODE" -eq 1 ]] && echo "  (NODE_PORT ${NODE_PORT}, SECRET_KEY: $([[ -n "$NODE_SECRET_KEY" ]] && L "есть" "set" || L "спросит при установке" "asked during install"))")$(plan_done "$DO_REMNANODE" "$ST_REMNANODE")"
 echo
 
 if ! ask_yn "$(L "Начать установку?" "Start installation?")" "y"; then
