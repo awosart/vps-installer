@@ -1362,11 +1362,11 @@ if [[ "$DO_UFW" -eq 1 ]]; then
     fi
 fi
 
-# block-icmp.sh правит правила UFW и перезапускает его, поэтому только вместе с шагом UFW.
+# block-icmp.sh правит правила UFW и перечитывает их, поэтому только вместе с шагом UFW.
 DO_ICMP=0
 if [[ "$DO_UFW" -eq 1 ]]; then
-    ask_yn "$(L "Заблокировать ICMP (block-icmp.sh: сервер не пингуется; мониторинг по ping перестанет видеть ноду)?" \
-                "Block ICMP (block-icmp.sh: server won't answer ping; ping-based monitoring will lose the node)?")$(done_hint "$ST_ICMP")" \
+    ask_yn "$(L "Скрыть сервер от ping (block-icmp.sh; мониторинг по ping перестанет видеть ноду)?" \
+                "Hide the server from ping (block-icmp.sh; ping-based monitoring will lose the node)?")$(done_hint "$ST_ICMP")" \
            "$(def_if_not_done "$ST_ICMP")" \
         && DO_ICMP=1
 fi
@@ -1390,7 +1390,7 @@ echo "  02d $(L "Лимиты (unlimit_server)  " "Limits (unlimit_server)  "): 
 echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")${NEW_SSH_PORT:+  (${CURRENT_SSH_PORTS% } -> ${NEW_SSH_PORT})}$(plan_done "$DO_SSH_PORT" "$ST_SSH_PORT")"
 echo "  04 $(L "Защита SSH (security.sh) " "SSH hardening (security.sh)"): $(yn_word "$DO_SECURITY")$(plan_done "$DO_SECURITY" "$ST_SECURITY")"
 echo "  05 $(L "Файрвол UFW              " "UFW firewall             "): $(yn_word "$DO_UFW")${UFW_PLAN}$(plan_done "$DO_UFW" "$ST_UFW")"
-echo "  05b $(L "Блок ICMP (block-icmp)   " "ICMP block (block-icmp)  "): $(yn_word "$DO_ICMP")$(plan_done "$DO_ICMP" "$ST_ICMP")"
+echo "  05b $(L "Скрыть ping (block-icmp) " "Hide ping (block-icmp)   "): $(yn_word "$DO_ICMP")$(plan_done "$DO_ICMP" "$ST_ICMP")"
 echo "  06 Fail2Ban                  : $(yn_word "$DO_F2B")$(plan_done "$DO_F2B" "$ST_F2B")"
 echo "  07 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")$(plan_done "$DO_DASHBOARD" "$ST_DASHBOARD")"
 echo "  08 Swap                      : $(yn_word "$DO_SWAP")$(plan_done "$DO_SWAP" "$ST_SWAP")"
@@ -1499,7 +1499,7 @@ else
     skip_step "05-ufw"
 fi
 
-# block-icmp.sh перезапускает UFW — только когда UFW настроен и включён.
+# block-icmp.sh перечитывает правила UFW — только когда UFW настроен и включён.
 if [[ "$DO_ICMP" -eq 1 ]] && ufw status 2>/dev/null | grep -q '^Status: active'; then
     run_remote "05b-icmp-block" "$ICMP_BLOCK_URL"
 else
