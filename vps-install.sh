@@ -36,6 +36,7 @@ BACKUP_DIR="${LOG_DIR}/backup"
 REMNANODE_URL="https://github.com/DigneZzZ/remnawave-scripts/raw/main/remnanode.sh"
 BBRV3_URL="https://raw.githubusercontent.com/opiran-club/VPS-Optimizer/main/bbrv3.sh"
 DIGNEZZZ_BASE="https://dignezzz.github.io/server"
+ICMP_BLOCK_URL="https://raw.githubusercontent.com/awosart/icmp_block/main/block-icmp.sh"
 
 XANMOD_REPO="http://deb.xanmod.org"
 XANMOD_KEY_URL="https://dl.xanmod.org/archive.key"
@@ -903,6 +904,22 @@ EOF
 }
 
 # ============================================================
+# STEP: SYSCTL
+# ============================================================
+
+# sysctl_opt.sh пишет /etc/sysctl.conf, но в новых Ubuntu (26.04) при загрузке
+# он не читается: ссылки /etc/sysctl.d/99-sysctl.conf нет. Без неё настройки
+# пропадут после перезагрузки. Имя 99-sysctl идёт после 99-bbr и 99-<провайдер>.
+ensure_sysctl_conf_loaded() {
+    [[ -f /etc/sysctl.conf ]] || return 1
+    if [[ ! -e /etc/sysctl.d/99-sysctl.conf ]]; then
+        ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf || return 1
+        info "$(L "Добавлена ссылка /etc/sysctl.d/99-sysctl.conf — /etc/sysctl.conf будет применяться при загрузке." \
+                  "Added /etc/sysctl.d/99-sysctl.conf link — /etc/sysctl.conf will be applied at boot.")"
+    fi
+}
+
+# ============================================================
 # STEP: UFW
 # Ни security.sh, ни f2b.sh UFW не включают, поэтому правила
 # и включение — здесь, после смены SSH-порта и до установки ноды.
@@ -1052,6 +1069,7 @@ sshd_option() {
 detect_state() {
     ST_XANMOD="" ST_BBR="" ST_SSH_PORT="" ST_SECURITY="" ST_UFW=""
     ST_F2B="" ST_DASHBOARD="" ST_SWAP="" ST_REMNANODE=""
+    ST_SYSCTL="" ST_LIMITS="" ST_ICMP=""
 
     if [[ "$(uname -r)" == *xanmod* ]]; then
         ST_XANMOD="$(L "работает" "running") ($(uname -r))"
@@ -1073,6 +1091,12 @@ detect_state() {
         && ST_DASHBOARD="$(L "установлен" "installed")"
     swapon --show --noheadings 2>/dev/null | grep -q . \
         && ST_SWAP="$(free -h 2>/dev/null | awk '/^Swap:/ { print $2 }')"
+    grep -qE '^net\.ipv4\.tcp_notsent_lowat *= *16384' /etc/sysctl.conf 2>/dev/null \
+        && ST_SYSCTL="$(L "применён" "applied")"
+    grep -q '^ulimit -n 1048576' /etc/profile 2>/dev/null \
+        && ST_LIMITS="$(L "сняты" "raised")"
+    grep -q 'echo-request -j DROP' /etc/ufw/before.rules 2>/dev/null \
+        && ST_ICMP="$(L "заблокирован" "blocked")"
     if remnanode_running; then
         ST_REMNANODE="$(L "работает" "running")"
     elif [[ -f "$REMNANODE_ENV" ]]; then
@@ -1105,7 +1129,8 @@ show_state() {
     for row in \
         "XanMod|$ST_XANMOD" "BBR|$ST_BBR" "$(L "SSH-порт" "SSH port")|$ST_SSH_PORT" \
         "$(L "Защита SSH" "SSH hardening")|$ST_SECURITY" "UFW|$ST_UFW" "Fail2Ban|$ST_F2B" \
-        "$(L "Дашборд" "Dashboard")|$ST_DASHBOARD" "Swap|$ST_SWAP" "Remnanode|$ST_REMNANODE"; do
+        "$(L "Дашборд" "Dashboard")|$ST_DASHBOARD" "Swap|$ST_SWAP" "Remnanode|$ST_REMNANODE" \
+        "sysctl_opt|$ST_SYSCTL" "$(L "Лимиты" "Limits")|$ST_LIMITS" "ICMP|$ST_ICMP"; do
         label="${row%%|*}" value="${row#*|}"
         [[ -n "$value" ]] || continue
         echo -e "  ${GREEN}✓${NC} ${label}: ${value}"
@@ -1275,6 +1300,19 @@ ask_yn "$(L "Настроить swap-файл?" "Configure swap file?")$(done_hi
        "$(def_if_not_done "$ST_SWAP")" \
     && DO_SWAP=1 || DO_SWAP=0
 
+# sysctl_opt.sh и unlimit_server.sh работают только на Ubuntu.
+DO_SYSCTL=0 DO_LIMITS=0
+if [[ "$ID" == "ubuntu" ]]; then
+    ask_yn "$(L "Оптимизировать сеть (sysctl_opt.sh: буферы, очереди, notsent_lowat)?" \
+                "Optimize networking (sysctl_opt.sh: buffers, queues, notsent_lowat)?")$(done_hint "$ST_SYSCTL")" \
+           "$(def_if_not_done "$ST_SYSCTL")" \
+        && DO_SYSCTL=1
+    ask_yn "$(L "Снять системные лимиты (unlimit_server.sh: ulimit в /etc/profile)?" \
+                "Raise system limits (unlimit_server.sh: ulimit in /etc/profile)?")$(done_hint "$ST_LIMITS")" \
+           "$(def_if_not_done "$ST_LIMITS")" \
+        && DO_LIMITS=1
+fi
+
 # ---------------- Remnanode ----------------
 
 ask_yn "$(L "Установить Remnanode?" "Install Remnanode?")$(done_hint "$ST_REMNANODE")" \
@@ -1324,6 +1362,15 @@ if [[ "$DO_UFW" -eq 1 ]]; then
     fi
 fi
 
+# block-icmp.sh правит правила UFW и перезапускает его, поэтому только вместе с шагом UFW.
+DO_ICMP=0
+if [[ "$DO_UFW" -eq 1 ]]; then
+    ask_yn "$(L "Заблокировать ICMP (block-icmp.sh: сервер не пингуется; мониторинг по ping перестанет видеть ноду)?" \
+                "Block ICMP (block-icmp.sh: server won't answer ping; ping-based monitoring will lose the node)?")$(done_hint "$ST_ICMP")" \
+           "$(def_if_not_done "$ST_ICMP")" \
+        && DO_ICMP=1
+fi
+
 # ---------------- Confirm ----------------
 
 yn_word() { [[ "$1" -eq 1 ]] && L "да" "yes" || L "нет" "no"; }
@@ -1338,9 +1385,12 @@ fi
 section "$(L "ПЛАН УСТАНОВКИ" "INSTALLATION PLAN")"
 echo "  01 $(L "Добавить SSH-ключ root   " "Add root SSH key         "): $(yn_word "$DO_SSH_KEY")"
 echo "  02 XanMod + BBRv3            : $(yn_word "$DO_XANMOD")$([[ "$DO_BBR_SCRIPT" -eq 1 ]] && echo "  (bbrv3.sh opiran)")$(plan_done "$DO_XANMOD" "$ST_XANMOD")"
+echo "  02c sysctl_opt               : $(yn_word "$DO_SYSCTL")$(plan_done "$DO_SYSCTL" "$ST_SYSCTL")"
+echo "  02d $(L "Лимиты (unlimit_server)  " "Limits (unlimit_server)  "): $(yn_word "$DO_LIMITS")$(plan_done "$DO_LIMITS" "$ST_LIMITS")"
 echo "  03 $(L "Сменить SSH-порт         " "Change SSH port          "): $(yn_word "$DO_SSH_PORT")${NEW_SSH_PORT:+  (${CURRENT_SSH_PORTS% } -> ${NEW_SSH_PORT})}$(plan_done "$DO_SSH_PORT" "$ST_SSH_PORT")"
 echo "  04 $(L "Защита SSH (security.sh) " "SSH hardening (security.sh)"): $(yn_word "$DO_SECURITY")$(plan_done "$DO_SECURITY" "$ST_SECURITY")"
 echo "  05 $(L "Файрвол UFW              " "UFW firewall             "): $(yn_word "$DO_UFW")${UFW_PLAN}$(plan_done "$DO_UFW" "$ST_UFW")"
+echo "  05b $(L "Блок ICMP (block-icmp)   " "ICMP block (block-icmp)  "): $(yn_word "$DO_ICMP")$(plan_done "$DO_ICMP" "$ST_ICMP")"
 echo "  06 Fail2Ban                  : $(yn_word "$DO_F2B")$(plan_done "$DO_F2B" "$ST_F2B")"
 echo "  07 $(L "Дашборд                  " "Dashboard                "): $(yn_word "$DO_DASHBOARD")$(plan_done "$DO_DASHBOARD" "$ST_DASHBOARD")"
 echo "  08 Swap                      : $(yn_word "$DO_SWAP")$(plan_done "$DO_SWAP" "$ST_SWAP")"
@@ -1401,6 +1451,15 @@ if [[ "$DO_BBR_SCRIPT" -eq 1 ]]; then
     run_remote "02b-bbrv3-opiran" "$BBRV3_URL" --ipv4
 fi
 
+if [[ "$DO_SYSCTL" -eq 1 ]]; then
+    run_remote "02c-sysctl-opt" "${DIGNEZZZ_BASE}/sysctl_opt.sh" \
+        && run_local "02c-sysctl-boot" ensure_sysctl_conf_loaded
+else
+    skip_step "02c-sysctl-opt"
+fi
+
+run_optional "$DO_LIMITS" "02d-unlimit" "${DIGNEZZZ_BASE}/unlimit_server.sh"
+
 # ============================================================
 # 03 - SSH PORT -> 04 - SECURITY -> 05 - UFW -> 06 - FAIL2BAN
 # Сначала ваш SSH-порт, затем UFW открывает фактический SSH-порт,
@@ -1438,6 +1497,13 @@ if [[ "$DO_UFW" -eq 1 ]]; then
     fi
 else
     skip_step "05-ufw"
+fi
+
+# block-icmp.sh перезапускает UFW — только когда UFW настроен и включён.
+if [[ "$DO_ICMP" -eq 1 ]] && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    run_remote "05b-icmp-block" "$ICMP_BLOCK_URL"
+else
+    skip_step "05b-icmp-block"
 fi
 
 if [[ "$DO_F2B" -eq 1 ]]; then
